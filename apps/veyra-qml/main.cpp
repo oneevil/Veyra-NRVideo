@@ -70,6 +70,7 @@
 #include "veyra/ui/QmlPlayerBridge.h"
 #include "../../src/ui/WinCaptionReader.h"
 #include "../../src/ui/AsrWorker.h"
+#include "../../src/ui/VoiceProtocol.h"
 #include "veyra/ui/StartupMusic.h"
 #include "veyra/ui/ThumbnailProvider.h"
 #include "veyra/ui/UiLanguage.h"
@@ -1421,6 +1422,8 @@ int main(int argc, char** argv) {
         return veyra::ui::runLiveCaptionReader();
     if (argc == 2 && std::strcmp(argv[1], "--asr-worker") == 0)
         return veyra::ui::asr::runWorker();
+    if (argc == 2 && std::strcmp(argv[1], "--voice-worker") == 0)
+        return veyra::ui::voice::runWorker();
     if (argc >= 2 && std::strcmp(argv[1], "--asr-file") == 0) {
         int count = 0;
         wchar_t** wide = CommandLineToArgvW(GetCommandLineW(), &count);

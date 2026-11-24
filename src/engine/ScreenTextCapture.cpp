@@ -3,6 +3,12 @@
 // logic in ScreenText.cpp is ported from VI Translator (MIT License).
 #include "veyra/engine/ScreenTextCapture.h"
 #include "veyra/engine/ScreenText.h"
+#include "veyra/engine/SubtitleFinder.h"
+#include "NeuralOcr.h"
+#include "SubtitleStyle.h"
+#include "SubtitleTracker.h"
+#include "WordList.h"
+#include "../tts/Ort.h"
 #include "veyra/Log.h"
 #include "veyra/RuntimePaths.h"
 
@@ -28,6 +34,7 @@
 #include <format>
 #include <fstream>
 #include <mutex>
+#include <optional>
 #include <thread>
 #include <vector>
 
@@ -301,8 +308,10 @@ struct ScreenTextCapture::State {
         uint64_t value=0,order=0,epoch=0;
         DXGI_FORMAT format=DXGI_FORMAT_UNKNOWN;
         uint32_t width=0,height=0,pitch=0,hdrMode=0,frameWidth=0,left=0;
+        bool whole=false; // the whole picture, for the search for the subtitles
     };
-    std::atomic<bool> armed{false},shutdown{false},busy{false};
+    struct FindRequest { std::wstring detector,recognizer,runtime; int seconds=12; };
+    std::atomic<bool> armed{false},shutdown{false},busy{false},finding{false};
     std::atomic<uint64_t> epoch{1};
     std::atomic<uint32_t> intervalMs{250};
     std::array<Slot,kSlots> slots;
@@ -313,6 +322,7 @@ struct ScreenTextCapture::State {
     ScreenTextOptions options;
     Region region;
     ScreenTextStatus published;
+    std::optional<FindRequest> findRequest;
     std::thread worker;
     // Engine thread only.
     int pending=-1;
@@ -330,6 +340,7 @@ void ScreenTextCapture::State::run(){
     try{winrt::init_apartment(winrt::apartment_type::multi_threaded);}catch(...){}
     OcrReader reader;
     screentext::LineTracker tracker;
+    screentext::NameReader names;
     uint64_t trackerEpoch=0;
     std::wstring openedLanguage,lastOpenError;
     bool opened=false;
@@ -344,6 +355,42 @@ void ScreenTextCapture::State::run(){
         std::filesystem::create_directories(debugDir,ec);
         log::info("screen-text",std::format("diagnostics on: words of every read and area images in {}",debugDir.string()));
     }
+    // The neural reader (PP-OCRv5) and what sorts its text: loaded when asked for, kept while the
+    // same model files are.
+    std::unique_ptr<tts::OrtRuntime> ortRuntime;
+    std::unique_ptr<screentext::NeuralOcr> neural;
+    std::wstring ortPath,neuralDet,neuralRec,failedNeural;
+    int64_t neuralRetryAt=0;
+    auto ensureNeural=[&](const std::wstring& det,const std::wstring& rec,const std::wstring& rt)->bool{
+        if(neural&&det==neuralDet&&rec==neuralRec&&rt==ortPath)return true;
+        const std::wstring key=det+L"|"+rec+L"|"+rt;
+        if(key==failedNeural&&nowMs()<neuralRetryAt)return false;
+        try{
+            neural.reset();
+            if(!ortRuntime||rt!=ortPath){ortRuntime.reset();ortPath.clear();ortRuntime=std::make_unique<tts::OrtRuntime>(std::filesystem::path(rt));ortPath=rt;}
+            screentext::NeuralOcrSettings settings;
+            settings.threads=int(std::clamp(std::thread::hardware_concurrency()/4u,2u,4u));
+            neural=std::make_unique<screentext::NeuralOcr>(*ortRuntime,std::filesystem::path(det),std::filesystem::path(rec),settings);
+            neuralDet=det;neuralRec=rec;failedNeural.clear();
+            log::info("screen-text",std::format("neural reader ready runtime={} threads={}",ortRuntime->version(),settings.threads));
+            return true;
+        }catch(const std::exception& e){
+            neural.reset();
+            failedNeural=key;neuralRetryAt=nowMs()+30000;
+            log::warn("screen-text",std::string("neural reader unavailable: ")+e.what());
+            return false;
+        }
+    };
+    screentext::WordList dictionary; // real Russian words, for choosing among readings
+    std::wstring dictionaryPath;int64_t dictionaryRetryAt=0;
+    std::unique_ptr<screentext::SubtitleStyle> sorter;
+    std::unique_ptr<screentext::SubtitleTracker> released;
+    bool sorterRussian=false,sorterDictionary=false;int sorterGame=-1,sorterNames=-1;
+    std::wstring shownNeural;
+    uint64_t neuralEpoch=0;
+    // The search for where the subtitles are.
+    bool findActive=false;int64_t findEndMs=0;uint32_t findW=0,findH=0;
+    std::vector<std::vector<screentext::FoundBox>> looks;
     while(!shutdown.load()){
         HANDLE events[2]={wake,gpuDone};
         WaitForMultipleObjects(2,events,FALSE,100);
@@ -359,13 +406,14 @@ void ScreenTextCapture::State::run(){
             if(slot.state.load(std::memory_order_acquire)!=2)continue;
             const uint64_t completed=slot.fence?slot.fence->GetCompletedValue():UINT64_MAX;
             if(completed!=UINT64_MAX&&completed<slot.value)continue; // still on the GPU
-            if(completed==UINT64_MAX||!on||slot.epoch!=generation){slot.state.store(0,std::memory_order_release);continue;}
+            if(completed==UINT64_MAX||(!slot.whole&&(!on||slot.epoch!=generation))){slot.state.store(0,std::memory_order_release);continue;}
             if(take>=0&&slots[size_t(take)].order>slot.order){slot.state.store(0,std::memory_order_release);continue;}
             if(take>=0)slots[size_t(take)].state.store(0,std::memory_order_release);
             take=int(i);
         }
         screentext::Crop crop;
         uint32_t factor=1,left=0,frameWidth=0;
+        bool wholeFrame=false;
         if(take>=0){
             auto& slot=slots[size_t(take)];
             void* mapped=nullptr;
@@ -376,10 +424,124 @@ void ScreenTextCapture::State::run(){
                 const D3D12_RANGE none{0,0};
                 slot.buffer->Unmap(0,&none);
             }else log::warn("screen-text",std::format("readback Map hr=0x{:08X}",unsigned(hr)));
-            left=slot.left;frameWidth=slot.frameWidth;
+            left=slot.left;frameWidth=slot.frameWidth;wholeFrame=slot.whole;
             slot.state.store(0,std::memory_order_release);
         }
+        // Looking for where the subtitles are: the whole picture twice a second, its text found
+        // (not read); after the given seconds the band they come and go in (SubtitleFinder.h).
+        {
+            std::optional<FindRequest> request;
+            {std::lock_guard lock(mutex);request=std::move(findRequest);findRequest.reset();}
+            if(request){
+                const bool loaded=ensureNeural(request->detector,request->recognizer,request->runtime); // (not under the lock: it takes a while)
+                std::lock_guard lock(mutex);
+                if(loaded){
+                    findActive=true;findEndMs=nowMs()+int64_t(request->seconds)*1000;looks.clear();findW=findH=0;
+                    published.findState=1;published.findSecondsLeft=request->seconds;
+                }else{
+                    findActive=false;finding.store(false);
+                    published.findState=4;published.findSecondsLeft=0;++published.findSequence;
+                }
+            }
+        }
+        if(findActive){
+            if(!crop.rgba.empty()&&wholeFrame&&neural){
+                busy.store(true);
+                try{
+                    std::vector<screentext::FoundBox> boxes;
+                    for(const auto& b:neural->findText(crop))boxes.push_back({b.left,b.top,b.right,b.bottom});
+                    looks.push_back(std::move(boxes));findW=crop.w;findH=crop.h;
+                }catch(const std::exception& e){
+                    log::warn("screen-text",std::string("subtitle search look failed: ")+e.what());
+                }
+                busy.store(false);
+            }
+            const int64_t remaining=findEndMs-nowMs();
+            std::lock_guard lock(mutex);
+            published.findSecondsLeft=int(std::max<int64_t>(0,(remaining+999)/1000));
+            if(remaining<=0){
+                findActive=false;finding.store(false);
+                const auto area=findW&&findH?screentext::locateSubtitles(looks,int(findW),int(findH)):std::nullopt;
+                published.findState=area?2:3;++published.findSequence;
+                if(area){
+                    published.foundX=float(area->left)/float(findW);published.foundY=float(area->top)/float(findH);
+                    published.foundW=float(area->width)/float(findW);published.foundH=float(area->height)/float(findH);
+                }
+                log::info("screen-text",std::format("subtitle search looks={} found={}",looks.size(),area?area->looks:0));
+            }
+            continue;
+        }
         if(!on){tracker.reset();continue;}
+        // The neural reader when it is asked for and loads; otherwise Windows' own.
+        const bool neuralOk=!o.detector.empty()&&!o.recognizer.empty()&&!o.runtime.empty()
+            &&ensureNeural(o.detector,o.recognizer,o.runtime);
+        if(neuralOk){
+            {
+                std::lock_guard lock(mutex);
+                published.ready=true;published.failed=false;published.error.clear();
+                published.language=o.language;published.neural=true;
+            }
+            opened=false; // Windows' reader is opened anew if the neural one is left
+            if(crop.rgba.empty())continue;
+            busy.store(true);
+            const auto begin=std::chrono::steady_clock::now();
+            // The real-word list (the voice writes it on its first start): looked for now and then.
+            if(!o.wordList.empty()&&(o.wordList!=dictionaryPath||(!dictionary.loaded()&&nowMs()>=dictionaryRetryAt))){
+                dictionaryPath=o.wordList;dictionaryRetryAt=nowMs()+60000;
+                if(dictionary.load(std::filesystem::path(o.wordList)))log::info("screen-text","real-word list loaded");
+            }
+            const bool russian=primaryTag(o.language)==L"ru";
+            if(!sorter||russian!=sorterRussian||o.game!=sorterGame||o.nameStyle!=sorterNames||dictionary.loaded()!=sorterDictionary){
+                screentext::Dictionaries words;
+                if(dictionary.loaded())words.russian=[&dictionary](std::wstring_view w){return dictionary.known(w);};
+                sorter=std::make_unique<screentext::SubtitleStyle>(russian,words,
+                    o.game==1?screentext::GameRules::Gta6:screentext::GameRules::None);
+                screentext::TrackerOptions trackerOptions;
+                trackerOptions.russian=russian;
+                trackerOptions.names=o.nameStyle==2?screentext::NameStyle::None:o.nameStyle==1?screentext::NameStyle::Line:screentext::NameStyle::Colon;
+                released=std::make_unique<screentext::SubtitleTracker>(trackerOptions,words);
+                sorterRussian=russian;sorterGame=o.game;sorterNames=o.nameStyle;sorterDictionary=dictionary.loaded();
+                shownNeural.clear();
+            }
+            if(neuralEpoch!=generation){released->reset();sorter->moved();shownNeural.clear();neuralEpoch=generation;}
+            std::vector<screentext::Piece> pieces;
+            try{pieces=neural->read(crop);}
+            catch(const std::exception& e){
+                if(!readFailureLogged){readFailureLogged=true;log::warn("screen-text",std::string("neural read ")+e.what());}
+            }
+            const auto found=sorter->read(crop,pieces);
+            const int64_t now=nowMs();
+            const auto line=found.byParts?released->updateParts(found.parts,now):released->update(found.lines,now,true,found.name);
+            std::wstring preview;
+            if(found.byParts)for(const auto& [who,said]:found.parts){if(!preview.empty())preview+=L" / ";preview+=who+L" "+said;}
+            else for(const auto& l:found.lines){if(!preview.empty())preview+=L' ';preview+=l;}
+            bool changedNeural=false;
+            if(line){
+                shownNeural=line->speech;
+                if(o.nameStyle!=2&&!line->speaker.empty())shownNeural=line->speaker+L": "+line->speech;
+                changedNeural=true;
+            }else if(!released->onScreen()&&!shownNeural.empty()){
+                shownNeural.clear();changedNeural=true;
+            }
+            const double ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-begin).count();
+            if(!debugDir.empty())
+                log::info("screen-text-debug",std::format("neural pieces={} scale={:.2f} ms={:.1f} lines=\"{}\" shown=\"{}\"",
+                    pieces.size(),neural->scale(),ms,utf8(preview),utf8(shownNeural)));
+            {
+                std::lock_guard lock(mutex);
+                ++published.reads;published.readMs=ms;published.reading=preview;published.words=uint32_t(pieces.size());
+                if(changedNeural&&epoch.load()==generation){
+                    published.text=shownNeural;++published.sequence;
+                    // (The frame was taken about one read before the read that first saw it ended.)
+                    published.appearedUs=line?line->appearedMs*1000-int64_t(ms*1000.0):0;
+                    if(line&&found.clipped)++published.clippedLines;
+                }
+            }
+            busy.store(false);
+            ++summaryReads;summaryMs+=ms;
+            continue;
+        }
+        {std::lock_guard lock(mutex);published.neural=false;}
         // The recognizer for the language on screen; a missing language is retried now and then
         // (the user may be installing it in Windows Settings meanwhile).
         if(!opened||o.language!=openedLanguage||(!reader.ready()&&nowMs()>=retryAt)){
@@ -419,8 +581,19 @@ void ScreenTextCapture::State::run(){
         }
         auto text=screentext::clean(words,english);
         if(english&&!screentext::looksLikeWords(text))text.clear();
-        if(trackerEpoch!=generation){tracker.reset();trackerEpoch=generation;}
+        // A speaker's name in a colour of its own, or (when the game writes it so) on a line of its
+        // own above the speech, becomes "Name: ..." (read as a name, not aloud). A game whose
+        // subtitles never name anyone: nothing is taken for a name.
+        if(!text.empty()&&o.nameStyle!=2){
+            std::wstring name=o.nameStyle==1?screentext::nameOnOwnLine(words):std::wstring{};
+            if(name.empty())name=names.name(crop,words);
+            text=screentext::markName(text,name);
+        }
+        if(trackerEpoch!=generation){tracker.reset();names.reset();trackerEpoch=generation;}
         const bool changed=tracker.feed(text,reading.sure,nowMs());
+        // A line reaching the left or right side of the area: its ends may be cut off.
+        const bool clipped=std::any_of(words.begin(),words.end(),[&](const screentext::Word& w){
+            return w.rect.x<=2||w.rect.x+w.rect.w+2>=crop.w;});
         const double ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-begin).count();
         if(!debugDir.empty()){
             log::info("screen-text-debug",std::format("words={} sure={} ms={:.1f} raw=\"{}\" kept=\"{}\" text=\"{}\" shown=\"{}\"",
@@ -434,7 +607,11 @@ void ScreenTextCapture::State::run(){
             std::lock_guard lock(mutex);
             ++published.reads;published.readMs=ms;published.reading=text;published.words=rawWords;
             // stop() or a new source in the meantime: that line is not this picture's
-            if(changed&&epoch.load()==generation){published.text=tracker.shown();++published.sequence;}
+            if(changed&&epoch.load()==generation){
+                published.text=tracker.shown();++published.sequence;
+                published.appearedUs=0; // (Windows' reader does not say when a line appeared)
+                if(clipped&&!published.text.empty())++published.clippedLines;
+            }
         }
         busy.store(false);
         ++summaryReads;summaryMs+=ms;
@@ -503,6 +680,7 @@ void ScreenTextCapture::start(const ScreenTextOptions& requested){
     const bool wasArmed=s.armed.exchange(true);
     if(!wasArmed||changed){
         ++s.epoch;
+        s.published.clippedLines=0;
         if(!s.published.text.empty()){s.published.text.clear();++s.published.sequence;}
     }
     if(!wasArmed){
@@ -536,6 +714,22 @@ void ScreenTextCapture::sessionEnded(){
     if(s.wake)SetEvent(s.wake);
 }
 
+void ScreenTextCapture::findSubtitles(const std::wstring& detector,const std::wstring& recognizer,
+                                      const std::wstring& runtime,int seconds){
+    auto& s=*state_;
+    std::lock_guard lock(s.mutex);
+    if(!s.worker.joinable()){
+        if(!s.wake||!s.gpuDone||!s.done){s.published.findState=4;++s.published.findSequence;return;}
+        try{s.worker=std::thread([state=state_]{state->run();});}
+        catch(const std::exception&){s.published.findState=4;++s.published.findSequence;return;}
+    }
+    s.findRequest=State::FindRequest{detector,recognizer,runtime,std::clamp(seconds,4,30)};
+    s.published.findState=1;s.published.findSecondsLeft=s.findRequest->seconds;
+    s.finding.store(true);
+    log::info("screen-text",std::format("subtitle search for {} s",s.findRequest->seconds));
+    if(s.wake)SetEvent(s.wake);
+}
+
 ScreenTextStatus ScreenTextCapture::status()const{
     auto& s=*state_;
     std::lock_guard lock(s.mutex);
@@ -547,9 +741,10 @@ ScreenTextStatus ScreenTextCapture::status()const{
 bool ScreenTextCapture::record(ID3D12GraphicsCommandList* list,const Frame& frame){
     auto& s=*state_;
     // Off, a generated (interpolated) frame, a read still in flight or not yet due: nothing.
-    if(!s.armed.load(std::memory_order_relaxed)||!list||!frame.texture||frame.generated||s.pending>=0||s.busy.load())return false;
+    const bool finding=s.finding.load(std::memory_order_relaxed);
+    if((!s.armed.load(std::memory_order_relaxed)&&!finding)||!list||!frame.texture||frame.generated||s.pending>=0||s.busy.load())return false;
     const int64_t now=nowMs();
-    if(now-s.lastRecordMs<int64_t(s.intervalMs.load()))return false;
+    if(now-s.lastRecordMs<int64_t(finding?500:s.intervalMs.load()))return false;
     const uint32_t bpp=bytesPerPixel(frame.format);
     if(!bpp){
         if(!s.formatLogged){s.formatLogged=true;log::warn("screen-text",std::format("unsupported output format {}",unsigned(frame.format)));}
@@ -560,7 +755,7 @@ bool ScreenTextCapture::record(ID3D12GraphicsCommandList* list,const Frame& fram
     {
         std::unique_lock lock(s.mutex,std::try_to_lock);
         if(!lock)return false; // never wait on the UI or the worker here
-        r=s.region;
+        r=finding?State::Region{}:s.region; // the search looks at the whole picture
     }
     const uint64_t generation=s.epoch.load();
     auto edge=[](float f,uint32_t size){return uint32_t(std::lround(std::clamp(f,0.0f,1.0f)*float(size)));};
@@ -608,7 +803,7 @@ bool ScreenTextCapture::record(ID3D12GraphicsCommandList* list,const Frame& fram
     std::swap(barrier.Transition.StateBefore,barrier.Transition.StateAfter);
     list->ResourceBarrier(1,&barrier); // back in COMMON, as the presenter hands it over
     slot.format=frame.format;slot.width=width;slot.height=height;slot.pitch=pitch;slot.hdrMode=frame.hdrMode;
-    slot.frameWidth=frame.width;slot.left=x0;slot.epoch=generation;
+    slot.frameWidth=frame.width;slot.left=x0;slot.epoch=generation;slot.whole=finding;
     s.pending=int(index);s.lastRecordMs=now;
     return true;
 }

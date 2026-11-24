@@ -141,17 +141,38 @@ void QmlPlayerBridge::tickSubtitles() {
         screenOptions.centeredOnly = liveTranslation_->screenTextCentered();
         screenOptions.language = liveTranslation_->screenTextLanguage().toStdWString();
         screenOptions.intervalMs = uint32_t(liveTranslation_->screenTextIntervalMs());
+        screenOptions.nameStyle = liveTranslation_->nameStyle();
+        if (liveTranslation_->screenTextNeural()) {
+            screenOptions.detector = liveTranslation_->neuralDetector().toStdWString();
+            screenOptions.recognizer = liveTranslation_->neuralRecognizer().toStdWString();
+            screenOptions.runtime = liveTranslation_->neuralRuntime().toStdWString();
+            screenOptions.game = liveTranslation_->screenTextGame();
+            screenOptions.wordList = liveTranslation_->wordList().toStdWString();
+        }
     }
     if (screenText != i.screenTextOn || (screenText && !(screenOptions == i.screenTextOptions))) {
         i.engine.setScreenText(screenText, screenOptions);
         i.screenTextOn = screenText;
         i.screenTextOptions = screenOptions;
     }
+    // Looking for where the subtitles are: asked from the window, answered by the engine.
+    if (liveTranslation_->takeFindRequest())
+        i.engine.findScreenSubtitles(liveTranslation_->neuralDetector().toStdWString(),
+                                     liveTranslation_->neuralFinderRecognizer().toStdWString(),
+                                     liveTranslation_->neuralRuntime().toStdWString(), 12);
+    if (liveTranslation_->findState() == LiveTranslation::FindLooking) {
+        const auto found = i.engine.screenTextSnapshot();
+        if (found.findState != 0)
+            liveTranslation_->acceptFind(found.findState, found.findSecondsLeft,
+                                         QRectF(found.foundX, found.foundY, found.foundW, found.foundH));
+    }
     if (screenText) {
         const auto onScreen = i.engine.screenTextSnapshot();
         liveTranslation_->acceptScreenText(QString::fromStdWString(onScreen.text), onScreen.ready,
                                            onScreen.error.empty() ? QString() : uiText(onScreen.error),
-                                           QString::fromStdWString(onScreen.reading), int(onScreen.words));
+                                           QString::fromStdWString(onScreen.reading), int(onScreen.words),
+                                           qint64(onScreen.appearedUs));
+        liveTranslation_->acceptClipped(onScreen.clippedLines);
     }
     // Draw. The overlay is a layered child of the video window: it moves with the
     // picture and is clipped by the same window region as the video itself.
@@ -231,7 +252,8 @@ void QmlPlayerBridge::tickSubtitles() {
     }
     // Live text is never copied into subtitle diagnostics or the export graph.
     const auto [original, translated, draft] = liveTranslation_->displayCaption();
-    if (original.isEmpty() && translated.isEmpty() && draft.isEmpty()) {
+    // "Show on the picture" off: the live caption is only read aloud.
+    if (!liveTranslation_->showOnVideo() || (original.isEmpty() && translated.isEmpty() && draft.isEmpty())) {
         updateSubtitleOverlay(i.subOverlay, draw, view);
         return;
     }

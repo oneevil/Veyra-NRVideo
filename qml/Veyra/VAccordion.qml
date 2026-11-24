@@ -147,6 +147,10 @@ Rectangle {
                     id: headerText
                     Layout.minimumWidth: 0
                     Layout.fillWidth: true
+                    // The text takes whatever the row leaves: its preferred width must not follow
+                    // its own (wrapping) text, or a title near the wrap point re-lays the row back
+                    // and forth (long Russian titles flickered between one line and two).
+                    Layout.preferredWidth: 1
                     spacing: 2
                     Text {
                         Layout.fillWidth: true

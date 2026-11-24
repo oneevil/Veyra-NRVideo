@@ -208,8 +208,12 @@ const ModelSource* ModelAssets::fallback() const {
 }
 
 bool ModelAssets::downloadsMembers() const {
-    const auto* alternate = fallback();
-    return alternate && alternate->memberFiles;
+    if (const auto* alternate = fallback()) return alternate->memberFiles;
+    // A primary URL ending in "/" is a folder of the asset's member files, for models that are
+    // published file by file with no archive (TeraTTSv2 on Hugging Face).
+    const auto& asset = assets_[asset_];
+    const std::string_view url = asset.url;
+    return !asset.members.empty() && !url.empty() && url.back() == '/';
 }
 
 void ModelAssets::startSource() {

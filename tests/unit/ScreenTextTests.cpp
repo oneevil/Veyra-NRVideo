@@ -4,6 +4,7 @@
 
 #include <clocale>
 #include <cstdio>
+#include <cwchar>
 #include <string>
 #include <vector>
 
@@ -152,6 +153,98 @@ void tracker() {
     t.reset();
     check(t.shown().empty(), "reset clears");
 }
+
+// A dark picture with words drawn as letter strokes (2 px of colour, 2 px of black outline).
+struct Painter {
+    Crop crop;
+    uint32_t x = 10;
+    Painter() { crop.w = 640; crop.h = 60; crop.rgba.assign(size_t(crop.w) * crop.h * 4, 0); for (size_t i = 3; i < crop.rgba.size(); i += 4) crop.rgba[i] = 255; }
+    Word word(const wchar_t* text, uint8_t r, uint8_t g, uint8_t b, uint32_t line = 0) {
+        const uint32_t width = uint32_t(std::wcslen(text)) * 14, y = 18, h = 24;
+        for (uint32_t yy = y + 2; yy < y + h - 2; ++yy)
+            for (uint32_t xx = x; xx < x + width; ++xx)
+                if ((xx / 2) % 2 == 0) { auto* p = &crop.rgba[(size_t(yy) * crop.w + xx) * 4]; p[0] = r; p[1] = g; p[2] = b; }
+        Word out{text, {x, y, width, h}, line};
+        x += width + 12;
+        return out;
+    }
+};
+
+// A fresh reader that has already seen one subtitle in `r,g,b` alone.
+NameReader readerOf(uint8_t r, uint8_t g, uint8_t b) {
+    NameReader reader;
+    Painter p;
+    std::vector<Word> ws{p.word(L"Мы", r, g, b), p.word(L"уходим", r, g, b)};
+    reader.name(p.crop, ws);
+    return reader;
+}
+std::wstring colouredName(const Crop& crop, const std::vector<Word>& words) { NameReader r; return r.name(crop, words); }
+
+void colouredNames() {
+    {
+        Painter p;
+        std::vector<Word> ws{p.word(L"Анна", 250, 160, 30), p.word(L"Отойди", 235, 235, 235), p.word(L"от", 235, 235, 235), p.word(L"машины!", 235, 235, 235)};
+        const auto name = colouredName(p.crop, ws);
+        check(name == L"Анна", "an orange name before white words is the name");
+        check(markName(L"Анна Отойди от машины!", name) == L"Анна: Отойди от машины!", "the name gets its colon");
+        check(markName(L"Анна: Отойди", name) == L"Анна: Отойди", "a colon already there stays one");
+        check(markName(L"Незнакомый человек: эй, ты!", L"Незнакомый человек") == L"Незнакомый человек: Эй, ты!",
+              "a coloured name before a line in small letters: the line gets its capital");
+        check(markName(L"Аннабель пришла", L"Анна") == L"Аннабель пришла", "a longer word is not the name");
+    }
+    {
+        Painter p;
+        std::vector<Word> ws{p.word(L"Police", 150, 230, 160), p.word(L"officers:", 150, 230, 160), p.word(L"Hands", 240, 240, 240), p.word(L"up!", 240, 240, 240)};
+        check(colouredName(p.crop, ws) == L"Police officers", "a name longer than its line, but ending in a colon: a name");
+        check(readerOf(240, 240, 240).name(p.crop, ws) == L"Police officers", "...and the pale green name once white lines were seen");
+    }
+    {
+        Painter p;
+        std::vector<Word> ws{p.word(L"Джон", 240, 240, 240), p.word(L"Где", 240, 220, 40), p.word(L"деньги", 240, 220, 40), p.word(L"Лебовски?", 240, 220, 40)};
+        check(colouredName(p.crop, ws) == L"Джон", "yellow subtitles: the white word is the name");
+        check(readerOf(240, 220, 40).name(p.crop, ws) == L"Джон", "...also when yellow lines were seen");
+    }
+    {
+        Painter p;
+        std::vector<Word> ws{p.word(L"Отойди", 235, 235, 235), p.word(L"от", 235, 235, 235), p.word(L"машины!", 235, 235, 235)};
+        check(colouredName(p.crop, ws).empty(), "all one colour: no name");
+    }
+    {
+        Painter p;
+        std::vector<Word> ws{p.word(L"Иди", 235, 235, 235), p.word(L"к", 235, 235, 235), p.word(L"Анне", 250, 160, 30)};
+        check(colouredName(p.crop, ws).empty(), "a coloured word at the end is read, not a name");
+        check(readerOf(235, 235, 235).name(p.crop, ws).empty(), "...also when white lines were seen");
+    }
+    {
+        Painter p;
+        std::vector<Word> ws{p.word(L"нажмите", 250, 160, 30), p.word(L"чтобы", 235, 235, 235), p.word(L"войти", 235, 235, 235)};
+        check(colouredName(p.crop, ws).empty(), "a lower-case coloured word is not a name");
+    }
+    {
+        // Every line starts with a name: the colour of the lines is learnt from those.
+        NameReader reader;
+        Painter a;
+        std::vector<Word> first{a.word(L"Джейсон:", 240, 220, 40), a.word(L"До", 235, 235, 235), a.word(L"сих", 235, 235, 235),
+                                a.word(L"пор", 235, 235, 235), a.word(L"не", 235, 235, 235), a.word(L"верю", 235, 235, 235)};
+        check(reader.name(a.crop, first) == L"Джейсон", "a yellow name before a longer white line");
+        Painter b;
+        std::vector<Word> second{b.word(L"Незнакомый", 150, 220, 230), b.word(L"человек", 150, 220, 230), b.word(L"Эй", 235, 235, 235)};
+        check(reader.name(b.crop, second) == L"Незнакомый человек", "...then a long name before a short line, colon or not");
+    }
+    {
+        Painter p;
+        std::vector<Word> ws{p.word(L"Анна", 250, 160, 30), p.word(L"Мария", 250, 160, 30)};
+        check(colouredName(p.crop, ws).empty(), "nothing in the body colour after it: no name");
+    }
+}
+void nameLines() {
+    auto at = [](const wchar_t* text, uint32_t x, uint32_t line) { auto v = w(text, x, line * 40, 40); v.line = line; return v; };
+    check(nameOnOwnLine({at(L"Анна", 100, 0), at(L"Пойдём", 80, 1), at(L"домой.", 160, 1)}) == L"Анна", "a name on its own line");
+    check(nameOnOwnLine({at(L"Старый", 80, 0), at(L"моряк:", 160, 0), at(L"Уходи.", 100, 1)}) == L"Старый моряк", "with its colon");
+    check(nameOnOwnLine({at(L"Пойдём", 80, 0), at(L"домой.", 160, 0)}).empty(), "one line: no name");
+    check(nameOnOwnLine({at(L"Мы", 80, 0), at(L"идём.", 160, 0), at(L"Быстрее!", 100, 1)}).empty(), "a sentence above is speech");
+    check(markName(L"Анна Пойдём домой.", L"Анна") == L"Анна: Пойдём домой.", "marked as a name");
+}
 } // namespace
 
 int main() {
@@ -163,5 +256,7 @@ int main() {
     quality_and_order();
     passes();
     tracker();
+    colouredNames();
+    nameLines();
     return failures ? 1 : 0;
 }

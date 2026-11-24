@@ -4,6 +4,8 @@
 #include "CaptionPresenter.h"
 #include "LiveAsr.h"
 #include "LiveSentences.h"
+#include "VoiceOver.h"
+#include "TranslationAssets.h"
 #include <QCache>
 #include <QElapsedTimer>
 #include <QQueue>
@@ -23,6 +25,20 @@ class LiveTranslation final : public QObject {
     Q_PROPERTY(QRectF customRegion READ customRegion WRITE setCustomRegion NOTIFY changed)
     Q_PROPERTY(QString screenReading READ screenReading NOTIFY previewChanged)
     Q_PROPERTY(int screenWords READ screenWords NOTIFY previewChanged)
+    // How the picture is read: 0 the neural reader (PP-OCRv5), 1 Windows' own.
+    Q_PROPERTY(int screenReader READ screenReader WRITE setScreenReader NOTIFY changed)
+    Q_PROPERTY(bool neuralInstalled READ neuralInstalled NOTIFY changed)
+    Q_PROPERTY(bool neuralDownloading READ neuralDownloading NOTIFY changed)
+    Q_PROPERTY(double neuralProgress READ neuralProgress NOTIFY changed)
+    Q_PROPERTY(qint64 neuralBytes READ neuralBytes CONSTANT)
+    // Whether the neural reader reads the source language (else Windows' reader is used).
+    Q_PROPERTY(bool neuralReadsLanguage READ neuralReadsLanguage NOTIFY changed)
+    Q_PROPERTY(bool screenTextNeuralReady READ screenTextNeural NOTIFY changed)
+    // Lines reached the side of the area twice this session: it is too narrow.
+    Q_PROPERTY(bool linesClipped READ linesClipped NOTIFY changed)
+    // Looking for the subtitles over the whole picture (FindState), and the seconds still to look.
+    Q_PROPERTY(int findState READ findState NOTIFY changed)
+    Q_PROPERTY(int findSecondsLeft READ findSecondsLeft NOTIFY changed)
     Q_PROPERTY(bool useGpu READ useGpu WRITE setUseGpu NOTIFY changed)
     Q_PROPERTY(bool windowsCaptionsSupported READ windowsCaptionsSupported CONSTANT)
     Q_PROPERTY(bool enabled READ enabled WRITE setEnabled NOTIFY changed)
@@ -42,6 +58,11 @@ class LiveTranslation final : public QObject {
     Q_PROPERTY(QString sourceLanguage READ sourceLanguage WRITE setSourceLanguage NOTIFY changed)
     Q_PROPERTY(QString targetLanguage READ targetLanguage WRITE setTargetLanguage NOTIFY changed)
     Q_PROPERTY(bool showOriginal READ showOriginal WRITE setShowOriginal NOTIFY changed)
+    // Draw the caption on the picture. Off: recognition, translation and the voice keep working,
+    // nothing is drawn (read aloud only).
+    Q_PROPERTY(bool showOnVideo READ showOnVideo WRITE setShowOnVideo NOTIFY changed)
+    // How the subtitles name who speaks (NameStyle): read off the picture and by the voice.
+    Q_PROPERTY(int nameStyle READ nameStyle WRITE setNameStyle NOTIFY changed)
     Q_PROPERTY(QString apiBase READ apiBase WRITE setApiBase NOTIFY changed)
     Q_PROPERTY(QString apiModel READ apiModel WRITE setApiModel NOTIFY changed)
     Q_PROPERTY(QString status READ status NOTIFY changed)
@@ -51,10 +72,15 @@ class LiveTranslation final : public QObject {
     Q_PROPERTY(bool downloading READ downloading NOTIFY changed)
     Q_PROPERTY(double downloadProgress READ downloadProgress NOTIFY changed)
     Q_PROPERTY(qint64 downloadBytes READ downloadBytes CONSTANT)
+    Q_PROPERTY(QObject* voice READ voice CONSTANT)
 public:
     enum Provider { Local, OpenAi, MyMemory };
     enum Source { VeyraAudio, WindowsCaptions, ScreenText };
-    enum ScreenRegion { BottomSubtitles, BottomWide, TopSubtitles, WholePicture, CustomRegion };
+    // Gta6: the "GTA VI" template - its area, measured on a recording of the game, and the
+    // game's own rule of what a subtitle is (only rows that begin with the speaker's name).
+    enum ScreenRegion { BottomSubtitles, BottomWide, TopSubtitles, WholePicture, CustomRegion, Gta6 };
+    // A game read by its own rules (the neural reader only): 0 none, 1 GTA VI.
+    int screenTextGame() const { return screenRegion_ == Gta6 ? 1 : 0; }
     explicit LiveTranslation(const QString& directory, QObject* parent = nullptr);
     ~LiveTranslation() override;
     bool sourceSupported() const;
@@ -68,6 +94,30 @@ public:
     int screenTextIntervalMs() const;
     QString screenReading() const { return screenReading_; }
     int screenWords() const { return screenWords_; }
+    enum Reader { NeuralReader, WindowsReader };
+    int screenReader() const { return screenReader_; }
+    bool neuralInstalled() const { return ocrAssets_.installed(); }
+    bool neuralDownloading() const { return ocrAssets_.downloading(); }
+    double neuralProgress() const { return double(ocrAssets_.received()) / double(std::max<qint64>(1, neuralBytes())); }
+    qint64 neuralBytes() const { return ocrAssets_.totalBytes(); }
+    bool neuralReadsLanguage() const;
+    // What the engine is to read with: the neural reader when chosen, downloaded and able to read
+    // the language; its model files and runtime (empty: Windows' reader).
+    bool screenTextNeural() const;
+    QString neuralDetector() const;
+    QString neuralRecognizer() const;
+    QString neuralRuntime() const;
+    QString wordList() const;
+    QString neuralFinderRecognizer() const; // a reading model for the search (any will do: nothing is read) // the stress dictionary's quick copy (may not exist yet)
+    enum FindState { FindIdle, FindLooking, FindFound, FindNothing, FindFailed };
+    int findState() const { return findState_; }
+    int findSecondsLeft() const { return findSecondsLeft_; }
+    // The engine asks: a search was requested (taken once).
+    bool takeFindRequest() { return std::exchange(findRequested_, false); }
+    // The engine reports on the search; `found`: the band as fractions of the picture.
+    void acceptFind(int state, int secondsLeft, QRectF found);
+    bool linesClipped() const { return linesClipped_; }
+    void acceptClipped(uint32_t lines);
     bool useGpu() const { return useGpu_; }
     static bool windowsCaptionsSupported();
     bool enabled() const { return enabled_; }
@@ -87,6 +137,9 @@ public:
     QString sourceLanguage() const;
     QString targetLanguage() const { return targetLanguage_; }
     bool showOriginal() const { return showOriginal_; }
+    bool showOnVideo() const { return showOnVideo_; }
+    enum NameStyle { NamesWithColon, NamesOnOwnLine, NoNames };
+    int nameStyle() const { return nameStyle_; }
     QString apiBase() const { return apiBase_; }
     QString apiModel() const { return apiModel_; }
     QString status() const;
@@ -102,6 +155,7 @@ public:
     bool downloading() const { return assets_.downloads.downloading(); }
     double downloadProgress() const { return double(assets_.downloads.received()) / double(downloadBytes()); }
     qint64 downloadBytes() const { return assets_.downloads.totalBytes(); }
+    QObject* voice() { return &voice_; }
 
     void setEnabled(bool value);
     void setProvider(int value);
@@ -109,13 +163,17 @@ public:
     void setScreenRegion(int value);
     void setCustomRegion(QRectF value);
     void setUseGpu(bool value);
+    // `appearedUs`: when the line on screen first showed up (sink::recordingClockUs; 0 unknown).
     void acceptScreenText(const QString& text, bool ready, const QString& error,
-                          const QString& reading = {}, int words = 0);
+                          const QString& reading = {}, int words = 0, qint64 appearedUs = 0);
     void setRecognitionModel(int value);
     void setRecognitionThreads(int value);
     void setSourceLanguage(QString value);
     void setTargetLanguage(QString value);
     void setShowOriginal(bool value);
+    void setShowOnVideo(bool value);
+    void setNameStyle(int value);
+    void setScreenReader(int value);
     void setApiBase(QString value);
     void setApiModel(QString value);
     Q_INVOKABLE void setApiKey(const QString& value);
@@ -125,6 +183,11 @@ public:
     Q_INVOKABLE void downloadRecognitionModel();
     Q_INVOKABLE void cancelRecognitionDownload() { asr_.cancel(); }
     Q_INVOKABLE void deleteRecognitionModel();
+    Q_INVOKABLE void downloadNeuralReader() { ocrAssets_.download(); }
+    Q_INVOKABLE void cancelNeuralDownload() { ocrAssets_.cancel(); }
+    // Watch the whole picture for a few seconds and take the band where subtitles appear as the
+    // area read (the neural reader's text finder; it must be downloaded).
+    Q_INVOKABLE void findSubtitles();
     void setPlayback(quint64 session, bool active, bool discontinuity);
 signals:
     void changed();
@@ -137,6 +200,7 @@ private:
         QStringList context;
         QString cacheKey;
         qint64 screenStart = -1;
+        qint64 screenAppearedUs = 0; // when the screen line first showed up (0: unknown)
         int phrases = 1;
         std::vector<qint64> wordEnds;
     };
@@ -155,11 +219,12 @@ private:
     };
 
     void setStatus(QString status);
+    void speak(quint64 id, const QString& translation, qint64 appearedUs);
     void configureAsr();
     void tick();
     void readCaptions();
     void acceptCaption(const QString& text);
-    void acceptScreenLine(const QString& text);
+    void acceptScreenLine(const QString& text, qint64 appearedUs);
     void stepScreenPresenter();
     void tickScreen(qint64 now);
     void serverNotListening(qint64 now);
@@ -185,6 +250,7 @@ private:
 
     TranslationAssets assets_;
     LiveAsr asr_;
+    VoiceOver voice_; // reads the translated lines aloud
     QSettings settings_;
     QNetworkAccessManager remoteNetwork_, localNetwork_;
     QProcess reader_, server_;
@@ -193,12 +259,19 @@ private:
     QNetworkReply* request_ = nullptr;
     HANDLE serverJob_ = nullptr;
     bool enabled_ = false, active_ = false, captionsOpen_ = false, serverFailed_ = false, readerStarted_ = false;
-    bool showOriginal_ = true, useGpu_ = true, gpuFailed_ = false;
+    int nameStyle_ = NamesWithColon;
+    int screenReader_ = NeuralReader;
+    ModelAssets ocrAssets_;
+    int findState_ = FindIdle, findSecondsLeft_ = 0;
+    bool findRequested_ = false, linesClipped_ = false;
+    QString directory_;
+    bool showOriginal_ = true, showOnVideo_ = true, useGpu_ = true, gpuFailed_ = false;
     int screenRegion_ = BottomSubtitles, screenWords_ = 0, screenRetries_ = 0;
     QRectF customRegion_{0.08, 0.70, 0.84, 0.27};
     QString screenCurrent_, screenReading_, screenError_;
+    quint64 spokenId_ = 0;
     quint64 screenLine_ = 0, screenSequence_ = 0, screenRequested_ = 0;
-    qint64 screenStart_ = 0, screenRetryAt_ = 0;
+    qint64 screenStart_ = 0, screenRetryAt_ = 0, screenAppearedUs_ = 0;
     CaptionPresenter<DisplayCaption> screenPresenter_;
     int provider_ = Local;
     int recognitionSource_ = VeyraAudio, recognitionModel_ = asr::Parakeet, recognitionThreads_ = 0;

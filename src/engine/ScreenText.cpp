@@ -558,4 +558,185 @@ bool LineTracker::feed(const std::wstring& text,bool sure,int64_t now){
 
 void LineTracker::reset(){candidate_.clear();current_.clear();candidateSince_=lastSeen_=-1;}
 
+// --- Veyra addition: the speaker's name told by its colour -------------------------------
+// Words in another colour that begin a subtitle are the speaker's name.
+namespace {
+struct Rgb { float r=0,g=0,b=0; bool valid=false; };
+constexpr float kColoured=0.18f;   // saturation from which a colour is a colour, not a shade of white
+constexpr float kSameHue=32.0f;    // degrees within which two colours are the same colour
+
+float saturation(const Rgb& c){
+    const float mx=std::max({c.r,c.g,c.b}),mn=std::min({c.r,c.g,c.b});
+    return mx>0?(mx-mn)/mx:0.0f;
+}
+float hue(const Rgb& c){
+    const float mx=std::max({c.r,c.g,c.b}),mn=std::min({c.r,c.g,c.b}),d=mx-mn;
+    if(d<=0)return 0;
+    float h=mx==c.r?std::fmod((c.g-c.b)/d,6.0f):mx==c.g?(c.b-c.r)/d+2.0f:(c.r-c.g)/d+4.0f;
+    h*=60.0f;
+    return h<0?h+360.0f:h;
+}
+
+// The colour of a word's letters: the strokes that stand out lighter than what is right around
+// them (subtitles are drawn with an outline or a shadow; smooth scenery does not count), and of
+// those the brighter half, which is the letters' own colour rather than their blurred edges.
+Rgb letterColour(const Crop& crop,const Rect& box){
+    Rgb out;
+    if(crop.rgba.size()<size_t(crop.w)*crop.h*4)return out;
+    const uint32_t x0=std::min(box.x,crop.w),y0=std::min(box.y,crop.h);
+    const uint32_t x1=std::min(crop.w,box.x+box.w),y1=std::min(crop.h,box.y+box.h);
+    if(x1<=x0+2||y1<=y0+2)return out;
+    const int radius=std::clamp(int(y1-y0)/10,1,4);
+    auto value=[&](uint32_t x,uint32_t y){
+        const uint8_t* p=&crop.rgba[(size_t(y)*crop.w+x)*4];
+        return std::max({p[0],p[1],p[2]});
+    };
+    struct Px { uint8_t v; uint8_t r,g,b; };
+    std::vector<Px> strokes;
+    for(uint32_t y=y0;y<y1;++y){
+        for(uint32_t x=x0;x<x1;++x){
+            const uint8_t v=value(x,y);
+            if(v<100)continue;
+            uint8_t low=v;
+            for(int dy=-radius;dy<=radius&&low+50>v;++dy){
+                const int yy=int(y)+dy;
+                if(yy<0||yy>=int(crop.h))continue;
+                for(int dx=-radius;dx<=radius;++dx){
+                    const int xx=int(x)+dx;
+                    if(xx<0||xx>=int(crop.w))continue;
+                    low=std::min(low,value(uint32_t(xx),uint32_t(yy)));
+                }
+            }
+            if(v-low<50)continue;
+            const uint8_t* p=&crop.rgba[(size_t(y)*crop.w+x)*4];
+            strokes.push_back({v,p[0],p[1],p[2]});
+        }
+    }
+    const size_t area=size_t(x1-x0)*(y1-y0);
+    if(strokes.size()<std::max<size_t>(12,area/50))return out; // hardly any letters: no judgement
+    std::sort(strokes.begin(),strokes.end(),[](const Px& a,const Px& b){return a.v>b.v;});
+    strokes.resize(std::max<size_t>(1,strokes.size()/2));
+    auto channel=[&](auto pick){
+        std::vector<uint8_t> v;v.reserve(strokes.size());
+        for(const auto& p:strokes)v.push_back(pick(p));
+        std::nth_element(v.begin(),v.begin()+v.size()/2,v.end());
+        return float(v[v.size()/2]);
+    };
+    out.r=channel([](const Px& p){return p.r;});
+    out.g=channel([](const Px& p){return p.g;});
+    out.b=channel([](const Px& p){return p.b;});
+    out.valid=true;
+    return out;
+}
+
+bool sameColour(const Rgb& a,const Rgb& b){
+    const float sa=saturation(a),sb=saturation(b);
+    const bool ca=sa>=kColoured,cb=sb>=kColoured;
+    if(!ca&&!cb)return true;                  // white and grey: subtitles' usual body
+    if(ca!=cb)return std::fabs(sa-sb)<0.10f;  // pale against white: too close to tell
+    const float d=std::fabs(hue(a)-hue(b));
+    return std::min(d,360.0f-d)<=kSameHue;
+}
+
+bool looksLikeName(const std::vector<std::wstring>& words){
+    if(words.empty()||words.size()>4)return false;
+    if(!isUpper(words.front().front()))return false;
+    bool letter=false;
+    for(const auto& w:words)for(wchar_t c:w){
+        if(asciiDigit(c)||contains(L".!?;,\"«»()[]",c))return false;
+        letter|=isLetter(c);
+    }
+    return letter;
+}
+} // namespace
+
+std::wstring NameReader::name(const Crop& crop,const std::vector<Word>& words){
+    std::vector<Rgb> colours;colours.reserve(words.size());
+    size_t valid=0;
+    for(const auto& w:words){colours.push_back(letterColour(crop,w.rect));valid+=colours.back().valid;}
+    if(valid<2)return {};
+    const Rgb remembered{r_,g_,b_,votes_>0};
+    // A line all in one colour: that is how this game writes its subtitles.
+    size_t first=0;while(!colours[first].valid)++first;
+    if(std::all_of(colours.begin(),colours.end(),[&](const Rgb& c){return !c.valid||sameColour(c,colours[first]);})){
+        if(remembered.valid&&sameColour(remembered,colours[first]))votes_=std::min(votes_+1,8);
+        else if(--votes_<=0){r_=colours[first].r;g_=colours[first].g;b_=colours[first].b;votes_=1;}
+        return {};
+    }
+    // Split as "name, then the line": the words of the first colour at the start of the first
+    // line, then the rest, which must all be of one other colour.
+    std::vector<std::wstring> name;
+    size_t i=0;
+    const Rgb lead=colours[0];
+    if(!lead.valid)return {};
+    size_t leadLetters=0;
+    for(;i<words.size()&&words[i].line==words.front().line&&colours[i].valid&&sameColour(colours[i],lead);++i){
+        name.push_back(words[i].text);leadLetters+=words[i].text.size();
+    }
+    if(i>=words.size()||!colours[i].valid)return {};
+    const Rgb rest=colours[i];
+    size_t restLetters=0;
+    for(size_t j=i;j<words.size();++j){
+        if(colours[j].valid&&!sameColour(colours[j],rest))return {};
+        restLetters+=words[j].text.size();
+    }
+    // Which of the two is the subtitle's own colour: the one the game has shown lines in, else
+    // the one of more letters; a colon ending the first colour ("Незнакомый человек:") makes
+    // it a name even before a short line. Undecided ("Иди к Анне" with nothing seen yet): none.
+    if(remembered.valid&&sameColour(remembered,lead))return {};
+    const bool colon=!name.empty()&&!name.back().empty()&&contains(L":：",name.back().back());
+    if(!(remembered.valid&&sameColour(remembered,rest))&&restLetters<=leadLetters&&!colon)return {};
+    while(!name.empty()){
+        auto& tail=name.back();
+        while(!tail.empty()&&contains(L":：-–—",tail.back()))tail.pop_back();
+        if(!tail.empty())break;
+        name.pop_back();
+    }
+    if(!looksLikeName(name))return {};
+    // The line after a name is in the subtitles' own colour: learnt from it too (a game whose
+    // every line starts with a name never shows a line in one colour).
+    if(remembered.valid&&sameColour(remembered,rest))votes_=std::min(votes_+1,8);
+    else if(--votes_<=0){r_=rest.r;g_=rest.g;b_=rest.b;votes_=1;}
+    return join(name);
+}
+
+void NameReader::reset(){r_=g_=b_=0;votes_=0;}
+
+std::wstring nameOnOwnLine(const std::vector<Word>& words){
+    if(words.empty())return {};
+    uint32_t first=words.front().line;
+    for(const auto& w:words)first=std::min(first,w.line);
+    std::vector<std::wstring> lead;
+    bool more=false;
+    for(const auto& w:words){
+        if(w.line==first)lead.push_back(w.text);
+        else more=true;
+    }
+    if(!more||!looksLikeName(lead))return {};
+    // a colon of its own ("Анна:") is the name's
+    if(!lead.back().empty()&&(lead.back().back()==L':'||lead.back().back()==L'\uFF1A'))lead.back().pop_back();
+    if(lead.back().empty())lead.pop_back();
+    if(lead.empty())return {};
+    std::wstring name;
+    for(const auto& w:lead){if(!name.empty())name+=L' ';name+=w;}
+    return name.size()<=30?name:std::wstring{};
+}
+
+std::wstring markName(const std::wstring& text,const std::wstring& name){
+    if(name.empty()||text.size()<=name.size())return text;
+    if(lowered(text.substr(0,name.size()))!=lowered(name))return text;
+    size_t at=name.size();
+    if(!isSpace(text[at])&&!contains(L":：",text[at]))return text; // "Анна" was the start of a longer word
+    while(at<text.size()&&isSpace(text[at]))++at;
+    if(at<text.size()&&contains(L":：",text[at]))++at;              // the colon may be there already
+    while(at<text.size()&&(isSpace(text[at])||contains(L"-–—",text[at])))++at;
+    auto rest=trimSpace(text.substr(at));
+    if(std::none_of(rest.begin(),rest.end(),isLetter))return text;
+    // The colour already says it is a name: the line after it starts with a capital, so that a
+    // name is told as one however the subtitle continues ("Незнакомый человек: эй, ты!").
+    const auto first=std::find_if(rest.begin(),rest.end(),isLetter);
+    *first=toUpper(*first);
+    return name+L": "+rest;
+}
+
 } // namespace veyra::engine::screentext

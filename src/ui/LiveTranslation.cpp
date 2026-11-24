@@ -5,6 +5,8 @@
 #include "LiveTranslation.h"
 #include "WinCaptionReader.h"
 #include "LocalWorkerJob.h"
+#include "OcrModels.h"
+#include "VoiceModels.h"
 #include "veyra/Log.h"
 #include "veyra/ui/LiveTranslationPrompt.h"
 
@@ -174,8 +176,13 @@ QRectF boundedRegion(QRectF r) {
 }
 
 LiveTranslation::LiveTranslation(const QString& directory, QObject* parent)
-    : QObject(parent), assets_(directory), asr_(directory),
-      settings_(QDir(directory).filePath(QStringLiteral("live-translation.ini")), QSettings::IniFormat) {
+    : QObject(parent), assets_(directory), asr_(directory), voice_(directory),
+      settings_(QDir(directory).filePath(QStringLiteral("live-translation.ini")), QSettings::IniFormat),
+      ocrAssets_(voice::root(directory), ocr::assets()),
+      directory_(directory) {
+    connect(&ocrAssets_, &ModelAssets::changed, this, &LiveTranslation::changed);
+    screenReader_ = std::clamp(settings_.value(QStringLiteral("screenReader"), int(NeuralReader)).toInt(),
+                               int(NeuralReader), int(WindowsReader));
     provider_ = std::clamp(settings_.value(QStringLiteral("provider"), int(Local)).toInt(), int(Local), int(MyMemory));
     sourceLanguage_ = settings_.value(QStringLiteral("source")).toString();
     targetLanguage_ = settings_.value(QStringLiteral("target"), QLocale().bcp47Name()).toString();
@@ -184,6 +191,10 @@ LiveTranslation::LiveTranslation(const QString& directory, QObject* parent)
     if (targetLanguage_ == QLatin1String("zh")) targetLanguage_ = QStringLiteral("zh-CN");
     if (!languageCode(targetLanguage_)) targetLanguage_ = QStringLiteral("en");
     showOriginal_ = settings_.value(QStringLiteral("original"), true).toBool();
+    showOnVideo_ = settings_.value(QStringLiteral("onVideo"), true).toBool();
+    nameStyle_ = std::clamp(settings_.value(QStringLiteral("nameStyle"), int(NamesWithColon)).toInt(),
+                            int(NamesWithColon), int(NoNames));
+    voice_.setNameStyle(nameStyle_);
     apiBase_ = settings_.value(QStringLiteral("apiBase")).toString();
     apiModel_ = settings_.value(QStringLiteral("apiModel")).toString();
 
@@ -195,7 +206,7 @@ LiveTranslation::LiveTranslation(const QString& directory, QObject* parent)
                                     int(VeyraAudio), int(ScreenText));
     if (!sourceSupported()) recognitionSource_ = VeyraAudio;
     screenRegion_ = std::clamp(settings_.value(QStringLiteral("screenRegion"), int(BottomSubtitles)).toInt(),
-                               int(BottomSubtitles), int(CustomRegion));
+                               int(BottomSubtitles), int(Gta6));
     if (settings_.contains(QStringLiteral("screenRect")))
         customRegion_ = boundedRegion(settings_.value(QStringLiteral("screenRect")).toRectF());
     recognitionModel_ = std::clamp(settings_.value(QStringLiteral("recognitionModel"), int(asr::Parakeet)).toInt(),
@@ -311,6 +322,9 @@ QRectF LiveTranslation::screenTextRect() const {
     case BottomWide: return {0.02, 0.62, 0.96, 0.36};
     case TopSubtitles: return {0.08, 0.03, 0.84, 0.27};
     case WholePicture: return {0.0, 0.0, 1.0, 1.0};
+    // GTA VI: the rows of its subtitles stand between 0.775 and 0.922 of the height, never wider
+    // than 0.56 of the width; the line that says what to do next, from 0.94, is left out.
+    case Gta6: return {0.17, 0.70, 0.66, 0.232};
     default: return customRegion_;
     }
 }
@@ -322,6 +336,65 @@ bool LiveTranslation::screenTextCentered() const {
 }
 
 // OCR needs a language; "auto" reads English, the usual language of game text.
+void LiveTranslation::setScreenReader(int value) {
+    if (value < NeuralReader || value > WindowsReader || screenReader_ == value) return;
+    screenReader_ = value;
+    settings_.setValue(QStringLiteral("screenReader"), value);
+    resetCaption();
+    emit changed();
+}
+
+bool LiveTranslation::neuralReadsLanguage() const { return !ocr::recognitionModel(screenTextLanguage()).isEmpty(); }
+
+bool LiveTranslation::screenTextNeural() const {
+    return screenReader_ == NeuralReader && neuralInstalled() && !neuralDownloading() && neuralReadsLanguage();
+}
+
+QString LiveTranslation::neuralDetector() const {
+    return QDir(ocr::modelFolder(directory_)).filePath(ocr::detectionModel());
+}
+
+QString LiveTranslation::neuralRecognizer() const {
+    const auto model = ocr::recognitionModel(screenTextLanguage());
+    return model.isEmpty() ? QString() : QDir(ocr::modelFolder(directory_)).filePath(model);
+}
+
+QString LiveTranslation::neuralRuntime() const { return ocr::runtimeLibrary(directory_); }
+QString LiveTranslation::neuralFinderRecognizer() const {
+    const auto own = neuralRecognizer();
+    return own.isEmpty() ? QDir(ocr::modelFolder(directory_)).filePath(ocr::recognitionModel(QStringLiteral("en"))) : own;
+}
+QString LiveTranslation::wordList() const {
+    return QDir(voice::cacheFolder(directory_)).filePath(QStringLiteral("teratts-accents.bin"));
+}
+
+void LiveTranslation::findSubtitles() {
+    if (!neuralInstalled()) { ocrAssets_.download(); return; }
+    findRequested_ = true;
+    findState_ = FindLooking;
+    findSecondsLeft_ = 12;
+    emit changed();
+}
+
+void LiveTranslation::acceptFind(int state, int secondsLeft, QRectF found) {
+    if (state == FindFound && found.isValid()) {
+        setCustomRegion(found);
+        setScreenRegion(CustomRegion);
+    }
+    if (state == findState_ && secondsLeft == findSecondsLeft_) return;
+    findState_ = state;
+    findSecondsLeft_ = secondsLeft;
+    emit changed();
+}
+
+// Two lines cut by the side of the area (counted afresh whenever the area changes): say so.
+void LiveTranslation::acceptClipped(uint32_t lines) {
+    const bool clipped = lines >= 2;
+    if (clipped == linesClipped_) return;
+    linesClipped_ = clipped;
+    emit changed();
+}
+
 QString LiveTranslation::screenTextLanguage() const {
     return sourceLanguage_.isEmpty() ? QStringLiteral("en") : sourceLanguage_;
 }
@@ -357,6 +430,15 @@ LiveTranslation::DisplayCaption LiveTranslation::displayCaption() const {
     }
     if (!rows_.empty() && rows_.back().originalUntil > now) return {rows_.back().original, {}};
     return {};
+}
+
+// Each translated line is read aloud once, when it goes up on the picture.
+// `appearedUs`: when the line appeared (sink::recordingClockUs), so that the voice can listen to
+// the game's sound from then on to tell who speaks it.
+void LiveTranslation::speak(quint64 id, const QString& translation, qint64 appearedUs) {
+    if (!enabled_ || translation.isEmpty() || id == spokenId_) return;
+    spokenId_ = id;
+    voice_.say(translation, appearedUs);
 }
 
 void LiveTranslation::setStatus(QString status) {
@@ -443,7 +525,7 @@ void LiveTranslation::setRecognitionSource(int value) {
 }
 
 void LiveTranslation::setScreenRegion(int value) {
-    if (value < BottomSubtitles || value > CustomRegion || screenRegion_ == value) return;
+    if (value < BottomSubtitles || value > Gta6 || screenRegion_ == value) return;
     screenRegion_ = value;
     settings_.setValue(QStringLiteral("screenRegion"), value);
     resetCaption();
@@ -460,7 +542,7 @@ void LiveTranslation::setCustomRegion(QRectF value) {
 }
 
 void LiveTranslation::acceptScreenText(const QString& text, bool ready, const QString& error,
-                                       const QString& reading, int words) {
+                                       const QString& reading, int words, qint64 appearedUs) {
     if (!enabled_ || recognitionSource_ != ScreenText) return;
     lastCaptionReadAt_ = clock_.elapsed();
     const auto preview = reading.left(300);
@@ -482,7 +564,7 @@ void LiveTranslation::acceptScreenText(const QString& text, bool ready, const QS
         if (!ready) resetCaption();
         else if (!screenPresenter_.shown()) setStatus(tr("正在等待画面字幕…"));
     }
-    if (active_ && ready) acceptScreenLine(text.left(500));
+    if (active_ && ready) acceptScreenLine(text.left(500), appearedUs);
 }
 
 void LiveTranslation::setUseGpu(bool value) {
@@ -544,6 +626,22 @@ void LiveTranslation::setShowOriginal(bool value) {
     emit captionChanged();
 }
 
+void LiveTranslation::setShowOnVideo(bool value) {
+    if (showOnVideo_ == value) return;
+    showOnVideo_ = value;
+    settings_.setValue(QStringLiteral("onVideo"), value);
+    emit changed();
+    emit captionChanged();
+}
+
+void LiveTranslation::setNameStyle(int value) {
+    if (value < NamesWithColon || value > NoNames || nameStyle_ == value) return;
+    nameStyle_ = value;
+    settings_.setValue(QStringLiteral("nameStyle"), value);
+    voice_.setNameStyle(value);
+    emit changed();
+}
+
 void LiveTranslation::setApiBase(QString value) {
     value = value.trimmed().left(1024);
     // Avoid saving credentials or query tokens in the configuration file.
@@ -591,6 +689,7 @@ void LiveTranslation::deleteRecognitionModel() { asr_.removeModel(); }
 void LiveTranslation::setPlayback(quint64 session, bool active, bool discontinuity) {
     const bool sourceChanged = session_ != session;
     if (!sourceChanged && active_ == active && !discontinuity) return;
+    if (sourceChanged) voice_.newSession();
     session_ = session;
     active_ = active;
     asr_.setPlayback(active, sourceChanged || discontinuity);
@@ -629,7 +728,7 @@ QString LiveTranslation::cacheKey(const QString& language, const QString& text) 
     return QString::number(provider_) + u'\n' + language + u'\n' + targetLanguage_ + u'\n' + text;
 }
 
-void LiveTranslation::acceptScreenLine(const QString& text) {
+void LiveTranslation::acceptScreenLine(const QString& text, qint64 appearedUs) {
     if (text == screenCurrent_) return;
     const qint64 now = clock_.elapsed();
     if (!screenCurrent_.isEmpty())
@@ -643,13 +742,16 @@ void LiveTranslation::acceptScreenLine(const QString& text) {
     }
     screenSequence_ = ++screenLine_;
     screenStart_ = now;
+    // Known only when it is a moment ago: otherwise the time it settled tells it (displayTranslation).
+    const qint64 nowUs = sink::recordingClockUs();
+    screenAppearedUs_ = appearedUs > 0 && appearedUs <= nowUs && nowUs - appearedUs < 3000000 ? appearedUs : 0;
     const QString language = screenTextLanguage();
     const auto key = cacheKey(language, text);
     const auto direct = sameLanguageCaption(text, language, targetLanguage_);
     const auto* cached = cache_.object(key);
     if (direct.isEmpty() && !cached) return;
     screenRequested_ = screenSequence_;
-    displayTranslation(Work{screenSequence_, {text, language, sink::recordingClockUs()}, {}, key, now},
+    displayTranslation(Work{screenSequence_, {text, language, sink::recordingClockUs()}, {}, key, now, screenAppearedUs_},
                        direct.isEmpty() ? *cached : direct);
 }
 
@@ -817,6 +919,7 @@ void LiveTranslation::advanceSpeech(qint64 now) {
                     row.translated.toStdString()));
             setStatus(tr("实时翻译运行中"));
         }
+        if (!fallback) speak(row.work.id, row.translated, row.work.sentence.endUs - 2500000);
         speechShown_ = std::move(row);
         emit captionChanged();
         return;
@@ -831,7 +934,16 @@ void LiveTranslation::displayTranslation(const Work& work, QString translation) 
     const auto now = clock_.elapsed();
     if (work.screenStart >= 0) {
         const auto readMs = std::clamp<qint64>(1000 + 40 * std::max(work.sentence.text.size(), translation.size()), 1200, 3500);
-        screenPresenter_.ready(work.id, work.screenStart, {work.sentence.text, std::move(translation)}, now, readMs);
+        // The voice reads every line as soon as it is ready, in order, also the ones the picture
+        // skips because a newer line came before the shown one had its time.
+        // A line the presenter refuses (cleared, older than the shown one, long gone) is not read.
+        const auto spoken = translation;
+        if (screenPresenter_.ready(work.id, work.screenStart, {work.sentence.text, std::move(translation)}, now, readMs)) {
+            // When the reader does not say when it appeared: about half a second before it
+            // settled (the reads it took to settle).
+            speak(work.id, spoken, work.screenAppearedUs > 0 ? work.screenAppearedUs
+                                   : sink::recordingClockUs() - (now - work.screenStart) * 1000 - 500000);
+        }
         stepScreenPresenter();
         return;
     }
@@ -843,6 +955,7 @@ void LiveTranslation::displayTranslation(const Work& work, QString translation) 
     if (row == rows_.end() || row->until <= now) return;
     const bool first = row->translated.isEmpty();
     row->translated = std::move(translation);
+    if (first) speak(work.id, row->translated, work.sentence.endUs - 2000000);
     row->until = now + displayDuration(row->translated);
     row->originalUntil = row->until;
     const auto delayMs = std::max<qint64>(0, (sink::recordingClockUs() - work.sentence.endUs) / 1000);
@@ -881,6 +994,7 @@ void LiveTranslation::discardHiddenWork() {
 
 void LiveTranslation::resetCaption() {
     cancelRequest();
+    voice_.silence();
     sentences_.reset(raw_);
     queue_.clear();
     context_.clear();
@@ -939,6 +1053,13 @@ void LiveTranslation::tick() {
             return;
         }
         stepScreenPresenter();
+        // Subtitles already in the language translated to are shown and read as they are:
+        // no translator is started or waited for.
+        if (!sameLanguageCaption(QStringLiteral("a"), screenTextLanguage(), targetLanguage_).isEmpty()) {
+            if (serverPort_) stopLocal();
+            setStatus(screenCurrent_.isEmpty() ? tr("正在等待画面字幕…") : tr("实时翻译运行中"));
+            return;
+        }
     } else {
         if (recognitionSource_ == VeyraAudio) pruneSpeech(now);
         else prune(now);
@@ -981,7 +1102,7 @@ void LiveTranslation::tickScreen(qint64 now) {
     screenRequested_ = screenSequence_;
     const auto language = screenTextLanguage();
     requestTranslation(Work{screenSequence_, {screenCurrent_, language, sink::recordingClockUs()},
-                            {}, cacheKey(language, screenCurrent_), screenStart_});
+                            {}, cacheKey(language, screenCurrent_), screenStart_, screenAppearedUs_});
 }
 
 void LiveTranslation::serverNotListening(qint64 now) {

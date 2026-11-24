@@ -72,6 +72,9 @@ QString root(const QString& dataDirectory) {
     return QDir(dataDirectory).absoluteFilePath(QStringLiteral("live-asr"));
 }
 
+const ModelAsset& runtimeAsset() { return runtime; }
+const ModelAsset& vadAsset() { return vad; }
+
 std::span<const ModelAsset> assets(int model) {
     switch (model) {
     case Parakeet: return parakeet;

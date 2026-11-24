@@ -424,6 +424,9 @@ void EngineController::setScreenText(bool enabled,const ScreenTextOptions& optio
     if(enabled)screenText_->start(options);else screenText_->stop();
 }
 ScreenTextStatus EngineController::screenTextSnapshot()const{return screenText_->status();}
+void EngineController::findScreenSubtitles(const std::wstring& detector,const std::wstring& recognizer,const std::wstring& runtime,int seconds){
+    screenText_->findSubtitles(detector,recognizer,runtime,seconds);
+}
 bool EngineController::setReplay(bool enabled,const RecordingSettings& options,std::wstring& error){
     error.clear();
     if(!enabled){replay_->stop();return true;}

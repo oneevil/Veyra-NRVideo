@@ -525,14 +525,31 @@ Rectangle {
         id: ccMenu
         aboveLimit: bar.menuBottomLimit
         title: qsTr("字幕")
-        items: [{ label: qsTr("关闭", "off"), checked: veyra.subtitlePrimary < 0, track: -1 }]
+        // As the 专业 page's menu: a capture card has no tracks, only the voice reading its subtitles.
+        readonly property var voiceOver: veyra.liveTranslation ? veyra.liveTranslation.voice : null
+        // The voice speaks only what live translation reads: switching it on here starts the
+        // reading too, and opens the settings when something is still missing (the voice not
+        // downloaded, the picture's text not chosen as the source, the reading refused).
+        function toggleVoice() {
+            const reading = veyra.liveTranslation
+            if (voiceOver.enabled) { voiceOver.enabled = false; return }
+            voiceOver.enabled = true
+            if (!reading.enabled) reading.enabled = true
+            if (!voiceOver.installed || !reading.enabled || (veyra.isCapture && reading.recognitionSource !== 2))
+                bar.requestDialog("translation")
+        }
+        items: (veyra.isCapture ? [] : [{ label: qsTr("关闭", "off"), checked: veyra.subtitlePrimary < 0, track: -1 }]
             .concat(veyra.subtitleTracks.map(t => ({ label: t.label, note: t.note, track: t.index,
                                                      disabled: !t.usable, checked: t.index === veyra.subtitlePrimary })))
             .concat([{ label: qsTr("加载外部字幕…"), icon: "import", act: "load" },
                      { sep: true },
-                     { label: qsTr("字幕设置…"), note: qsTr("字体、字号、描边、位置、延时"), icon: "type", act: "dlg" }])
+                     { label: qsTr("字幕设置…"), note: qsTr("字体、字号、描边、位置、延时"), icon: "type", act: "dlg" }]))
+            .concat(voiceOver ? [{ label: qsTr("朗读译文"), icon: "vol", checked: voiceOver.enabled, act: "voice" }] : [])
+            .concat([{ label: qsTr("实时翻译设置…"), icon: "type", act: "translation" }])
         onPicked: (i, o) => {
-            if (o.act === "load") veyra.loadSubtitleDialog()
+            if (o.act === "voice") toggleVoice()
+            else if (o.act === "translation") bar.requestDialog("translation")
+            else if (o.act === "load") veyra.loadSubtitleDialog()
             else if (o.act === "dlg") bar.requestDialog("subtitle")
             else if (o.track !== undefined) veyra.subtitlePrimary = o.track
         }

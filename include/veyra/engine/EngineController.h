@@ -324,6 +324,7 @@ public:
     // Any thread.
     void setScreenText(bool enabled,const ScreenTextOptions& options);
     ScreenTextStatus screenTextSnapshot()const;
+    void findScreenSubtitles(const std::wstring& detector,const std::wstring& recognizer,const std::wstring& runtime,int seconds);
     // Instant replay (#103): while enabled, the last options.replaySeconds of
     // whatever is presented stay in memory, across sessions; saveReplay()
     // writes them to a new file in the background. Any thread.

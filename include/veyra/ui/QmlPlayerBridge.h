@@ -1137,6 +1137,8 @@ public:
     Q_INVOKABLE void updateExclusionMove(double x,double y);
     Q_INVOKABLE bool endExclusionMove(bool commit);
     Q_INVOKABLE bool beginMaskDraw(bool allEffects,const QString& shape);
+    // Live translation: the area read for on-screen text, drawn on the picture like a mask region.
+    Q_INVOKABLE bool beginTranslationRegionDraw();
     Q_INVOKABLE bool setMaskEnabled(bool allEffects,bool enabled);
     Q_INVOKABLE bool setMaskFeather(bool allEffects,double pixels);
     Q_INVOKABLE bool removeMaskRegion(bool allEffects,int index);

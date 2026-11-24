@@ -874,6 +874,9 @@ void setForceStereoDownmix(bool enabled){
     log::info("audio-endpoint",std::format("force stereo downmix={}",enabled));
 }
 bool forceStereoDownmix(){std::lock_guard lock(gEndpointMutex);return gForceStereo;}
+namespace{std::atomic<float> gVoiceDuck{1.0f};}
+void setVoiceDuck(float gain){gVoiceDuck.store(std::isfinite(gain)?std::clamp(gain,0.0f,1.0f):1.0f);}
+float voiceDuck(){return gVoiceDuck.load();}
 ActiveRenderEndpoint activeRenderEndpoint(){std::lock_guard lock(gEndpointMutex);return gActiveEndpoint;}
 uint64_t renderEndpointGeneration(){return gEndpointGeneration.load();}
 void setBitstreamRenderEndpoint(const std::wstring& id){
@@ -1145,11 +1148,12 @@ bool AudioRenderer::pumpOnce(AudioPcmSource& pipeline, double* firstWrittenPtsMs
     }
     if (got > 0) {
         for(unsigned c=0;c<inputFormat_.channels;++c)lastRaw_[c]=chunk_[(got-1)*inputFormat_.channels+c];
-        const float target=clampAudioGain(gain_.load());
+        const float user=clampAudioGain(gain_.load());
+        const float target=clampAudioGain(user*voiceDuck());
         const bool boosted=std::max(target,smoothedGain_)>1.0f;
         applyPcmGain(chunk_.data(),got,inputFormat_.channels,target,smoothedGain_);
         if(fadeInRemaining_)fadePcmHead(chunk_.data(),got,inputFormat_.channels,fadeInRemaining_);
-        if(target!=loggedGain_&&std::abs(smoothedGain_-target)<.00001f){loggedGain_=target;log::info("audio-gain",std::format("target={} reached={} framesWritten={} clockPreserved=true applicationPCM=true",target,smoothedGain_,framesWritten_.load()));}
+        if(user!=loggedGain_&&std::abs(smoothedGain_-target)<.00001f){loggedGain_=user;log::info("audio-gain",std::format("target={} reached={} framesWritten={} clockPreserved=true applicationPCM=true",target,smoothedGain_,framesWritten_.load()));}
         if(!copyPcm(dest,chunk_.data(),got,boosted)){render_->ReleaseBuffer(0,0);return false;}
         if (got < written) {
             std::memset(dest + got * outputFormat_.channels*4, 0, (written - got) * outputFormat_.channels*4);

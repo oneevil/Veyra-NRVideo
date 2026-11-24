@@ -867,7 +867,8 @@ VPage {
                     objectName: "pro-subtitles"
                     glyph: "cc"
                     tip: qsTr("字幕")
-                    visible: veyra.hasSource && !veyra.isCapture
+                    // (Also for a capture card: its subtitles are read off the picture and voiced.)
+                    visible: veyra.hasSource
                     onTapped: proCcMenu.openAt(proCcButton, "up")
                 }
                 BarButton {
@@ -2181,15 +2182,31 @@ VPage {
     VMenu {
         id: proCcMenu
         title: qsTr("字幕")
-        items: [{ label: qsTr("关闭", "off"), checked: veyra.subtitlePrimary < 0, track: -1 }]
+        // The voice reading the subtitles (LiveTranslation's VoiceOver), switched on and off here.
+        readonly property var voiceOver: veyra.liveTranslation ? veyra.liveTranslation.voice : null
+        // The voice speaks only what live translation reads: switching it on here starts the
+        // reading too, and opens the settings when something is still missing (the voice not
+        // downloaded, the picture's text not chosen as the source, the reading refused).
+        function toggleVoice() {
+            const reading = veyra.liveTranslation
+            if (voiceOver.enabled) { voiceOver.enabled = false; return }
+            voiceOver.enabled = true
+            if (!reading.enabled) reading.enabled = true
+            if (!voiceOver.installed || !reading.enabled || (veyra.isCapture && reading.recognitionSource !== 2))
+                root.requestDialog("translation")
+        }
+        // A capture card has no subtitle tracks: only reading its picture's subtitles aloud.
+        items: (veyra.isCapture ? [] : [{ label: qsTr("关闭", "off"), checked: veyra.subtitlePrimary < 0, track: -1 }]
             .concat(veyra.subtitleTracks.map(t => ({ label: t.label, note: t.note, track: t.index,
                                                      disabled: !t.usable, checked: t.index === veyra.subtitlePrimary })))
             .concat([{ label: qsTr("加载外部字幕…"), icon: "import", act: "load" },
                      { sep: true },
-                     { label: qsTr("字幕设置…"), note: qsTr("字体、字号、描边、位置、延时"), icon: "type", act: "dlg" },
-                     { label: qsTr("实时翻译设置…"), icon: "type", act: "translation" }])
+                     { label: qsTr("字幕设置…"), note: qsTr("字体、字号、描边、位置、延时"), icon: "type", act: "dlg" }]))
+            .concat(voiceOver ? [{ label: qsTr("朗读译文"), icon: "vol", checked: voiceOver.enabled, act: "voice" }] : [])
+            .concat([{ label: qsTr("实时翻译设置…"), icon: "type", act: "translation" }])
         onPicked: (i, o) => {
-            if (o.act === "load") veyra.loadSubtitleDialog()
+            if (o.act === "voice") toggleVoice()
+            else if (o.act === "load") veyra.loadSubtitleDialog()
             else if (o.act === "dlg") root.requestDialog("subtitle")
             else if (o.act === "translation") root.requestDialog("translation")
             else if (o.track !== undefined) veyra.subtitlePrimary = o.track

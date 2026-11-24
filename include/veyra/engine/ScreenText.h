@@ -89,6 +89,26 @@ bool wordsOutOfOrder(const std::vector<Word>& words);
 std::vector<Word> fillGaps(const std::vector<Word>& best,const std::vector<const std::vector<Word>*>& others,bool english=true);
 std::vector<bool> outlinedLetters(const Crop& crop);
 
+// Veyra addition: words in another colour than the rest that begin the
+// subtitle are the speaker's name. The subtitles' own colour is learnt from the lines written in
+// one colour (in a game with yellow subtitles a white word is the mark); reset() with the source.
+// name() returns the name ("" none); the words' rects are in crop pixels.
+// markName("Анна Привет", "Анна") -> "Анна: Привет", so the name is handled as one written with
+// a colon (not read aloud, a narrator of its own).
+class NameReader {
+public:
+    std::wstring name(const Crop& crop,const std::vector<Word>& words);
+    void reset();
+private:
+    float r_=0,g_=0,b_=0;
+    int votes_=0;
+};
+std::wstring markName(const std::wstring& text,const std::wstring& name);
+// A game that writes the speaker's name on a line of its own above the speech: the first OCR
+// line when it reads as a name (one to four words, the first capitalised, no sentence marks)
+// and there is more below it; "" otherwise.
+std::wstring nameOnOwnLine(const std::vector<Word>& words);
+
 // When a reading is a new line to show, and when the shown line is gone.
 // A line is shown once it has been read alike for stableMs (three times as long
 // when the reading is unsure: text still fading in); it is cleared once no text

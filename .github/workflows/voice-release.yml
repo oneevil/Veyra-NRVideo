@@ -1,0 +1,414 @@
+name: Voice-over release (full features)
+
+# The fork's release build: everything windows-build.yml builds, plus PS5 Remote Play
+# (pinned chiaki-ng with scripts/remoteplay/patches), Moonlight (pinned moonlight-common-c)
+# and Xbox streaming (libdatachannel), all from pinned sources. The packages are the official
+# Veyra 2.2.1 portable packages with the program replaced by this build (the branch is the
+# 2.2.1 release commit plus the voice-over work), so the GPU runtimes stay the vendor's own.
+#
+# A push of the voice-over branch builds the packages (an artifact of the run); a push of a
+# tag like v2.2.1-voice.1 builds them and publishes a GitHub release under that tag.
+#
+# Where: GitHub's windows-2022, or a PC of one's own when the repository variable VOICE_RUNNER
+# names its runner label ("veyra", see tools/ci/setup-windows-runner.ps1). Such a runner keeps
+# its dependencies and build folder between runs; every step below skips what is already there.
+
+on:
+  push:
+    branches: [voice-over]
+    tags: ['v*-voice*']
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: 'Publish a GitHub release'
+        type: boolean
+        default: false
+      tag:
+        description: 'Release tag'
+        default: 'v2.2.1-voice.1'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: voice-release-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  VCPKG_COMMIT: 30ef65cad98f08e7197c9a1656fbd871bcb72f2d   # = vcpkg.json builtin-baseline
+  QT_VERSION: '6.8.3'
+  CARGO_C_VERSION: '0.10.26'
+  CHIAKI_COMMIT: 0e16950165f06e5c3291537c2eeba6e852be7120  # scripts/remoteplay/dependency-lock.json
+  MOONLIGHT_COMMIT: f900dd4767759c7b9d0e93bcea666b55c69ea62f # scripts/moonlight/dependency-lock.json
+  SDL3_SHA512: 6e6f91cde7dffec527af8a9b0162e9fb7997ec2b6770d3002c662cd75e5cd01afd2fb5f5cadfa2496c86e67ed22e876d99ebdf60b9ea7431a3a3caf5686d0f8f
+  BASE_VERSION: '2.2.1'
+  # Everything the build makes or downloads, outside the checkout (kept by an own runner).
+  VROOT: 'C:\Distr\veyra-ci'
+  VROOT_FWD: 'C:/Distr/veyra-ci'
+  # CMake 4 (an own runner may have it) refuses projects asking for CMake < 3.5 (chiaki-ng's and
+  # moonlight's dependencies); this lets them configure as they do with 3.31. No effect on 3.x.
+  CMAKE_POLICY_VERSION_MINIMUM: '3.5'
+
+jobs:
+  build:
+    runs-on: ${{ vars.VOICE_RUNNER || 'windows-2022' }}
+    timeout-minutes: 360
+    permissions:
+      contents: write
+    defaults:
+      run:
+        shell: pwsh -NoProfile -Command "$ErrorActionPreference = 'Stop'; $PSNativeCommandUseErrorActionPreference = $true; . '{0}'"
+    steps:
+      - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
+        with:
+          persist-credentials: false
+
+      - name: Stage pinned SDK headers and import libraries
+        run: |
+          New-Item -ItemType Directory -Force $env:VROOT | Out-Null
+          if (Test-Path third_party_local) { throw 'third_party_local must not be tracked in Git' }
+          scripts/ci/fetch-sdks.ps1 -VeyraRoot . -WorkRoot $env:VROOT\sdk-src -ManifestOut $env:VROOT\sdk-manifest.json
+
+      - name: Install Qt ${{ env.QT_VERSION }}
+        if: runner.environment == 'github-hosted'
+        uses: jurplel/install-qt-action@d325aaf2a8baeeda41ad0b5d39f84a6af9bcf005 # v4.3.0
+        with:
+          version: ${{ env.QT_VERSION }}
+          arch: win64_msvc2022_64
+          cache: false
+
+      - name: Install Qt ${{ env.QT_VERSION }} once (own runner)
+        if: runner.environment != 'github-hosted'
+        run: |
+          $qt = "$env:VROOT\Qt\$env:QT_VERSION\msvc2022_64"
+          if (-not (Test-Path "$qt\bin\qmake.exe")) {
+            python -m pip install --quiet --upgrade aqtinstall
+            python -m aqt install-qt windows desktop $env:QT_VERSION win64_msvc2022_64 -O $env:VROOT\Qt
+          }
+          "QT_ROOT_DIR=$qt" >> $env:GITHUB_ENV
+          "Qt6_DIR=$qt" >> $env:GITHUB_ENV
+          "$qt\bin" >> $env:GITHUB_PATH
+
+      - uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
+        with:
+          arch: x64
+
+      - name: Restore cargo-c
+        id: cargo-c-cache
+        if: runner.environment == 'github-hosted'
+        uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: ~\.cargo\bin\cargo-c*
+          key: cargo-c-${{ env.CARGO_C_VERSION }}-v1
+
+      - name: Build libdovi 3.4.0 from source
+        run: |
+          if (Test-Path $env:VROOT\dovi\include\libdovi\rpu_parser.h) { Write-Host 'libdovi already built'; exit 0 }
+          # rustup puts cargo in the user's profile; an own runner started before Rust was installed
+          # (or reinstalled) does not have it on PATH yet.
+          $cargoBin = Join-Path $env:USERPROFILE '.cargo\bin'
+          if ((Test-Path $cargoBin) -and ($env:Path -notlike "*$cargoBin*")) { $env:Path = "$cargoBin;$env:Path" }
+          if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) { throw "cargo not found: install Rust (rustup) and restart the runner" }
+          if ('${{ steps.cargo-c-cache.outputs.cache-hit }}' -ne 'true') {
+            cargo install cargo-c --version $env:CARGO_C_VERSION --locked
+          }
+          Push-Location (Join-Path $env:DOVI_SOURCE 'dolby_vision')
+          cargo cinstall --release --locked --prefix $env:VROOT\dovi --library-type cdylib
+          Pop-Location
+          if (-not (Test-Path $env:VROOT\dovi\lib\dovi.lib) -and (Test-Path $env:VROOT\dovi\lib\dovi.dll.lib)) {
+            Copy-Item $env:VROOT\dovi\lib\dovi.dll.lib $env:VROOT\dovi\lib\dovi.lib
+          }
+          if (-not (Test-Path $env:VROOT\dovi\include\libdovi\rpu_parser.h)) { throw 'libdovi header missing' }
+
+      - name: Save cargo-c
+        if: runner.environment == 'github-hosted' && steps.cargo-c-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: ~\.cargo\bin\cargo-c*
+          key: cargo-c-${{ env.CARGO_C_VERSION }}-v1
+
+      - name: Fetch vcpkg at the builtin-baseline and prepare the patched FFmpeg port
+        run: |
+          function Get-Head([string]$dir) {   # the checked-out commit, '' when there is none yet
+            $PSNativeCommandUseErrorActionPreference = $false
+            $head = git -C $dir rev-parse -q --verify HEAD 2>$null
+            if ($LASTEXITCODE) { '' } else { "$head".Trim() }
+          }
+          if (-not (Test-Path $env:VROOT\v\.git)) {
+            git init -q $env:VROOT\v
+            git -C $env:VROOT\v remote add origin https://github.com/microsoft/vcpkg.git
+          }
+          if ((Get-Head $env:VROOT\v) -ne $env:VCPKG_COMMIT) {
+            git -C $env:VROOT\v fetch -q --depth 1 origin $env:VCPKG_COMMIT
+            git -C $env:VROOT\v -c advice.detachedHead=false checkout -q -f FETCH_HEAD
+            Remove-Item $env:VROOT\v\vcpkg.exe -ErrorAction SilentlyContinue
+          }
+          if (-not (Test-Path $env:VROOT\v\vcpkg.exe)) { & "$env:VROOT\v\bootstrap-vcpkg.bat" -disableMetrics }
+          if (Test-Path $env:VROOT\vcpkg-overlay) { Remove-Item $env:VROOT\vcpkg-overlay -Recurse -Force }
+          python scripts/ci/make-ffmpeg-overlay.py $env:VROOT\v . $env:VROOT\vcpkg-overlay
+          $all = (Get-ChildItem $env:VROOT\vcpkg-overlay -Recurse -File | Get-FileHash | ForEach-Object Hash) -join ''
+          "OVERLAY_HASH=$([Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($all))))" >> $env:GITHUB_ENV
+
+      - name: Restore vcpkg binary cache
+        if: runner.environment == 'github-hosted'
+        uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: ${{ env.VROOT }}\vcache
+          key: vcpkg-full-${{ env.VCPKG_COMMIT }}-${{ env.OVERLAY_HASH }}-v1
+          restore-keys: |
+            vcpkg-full-${{ env.VCPKG_COMMIT }}-${{ env.OVERLAY_HASH }}-
+            vcpkg-${{ env.VCPKG_COMMIT }}-${{ env.OVERLAY_HASH }}-
+
+      - name: Build FFmpeg and the streaming dependencies with vcpkg
+        env:
+          VCPKG_BINARY_SOURCES: clear;files,${{ env.VROOT }}\vcache,readwrite
+          VCPKG_DISABLE_METRICS: '1'
+        run: |
+          New-Item -ItemType Directory -Force $env:VROOT\vcache | Out-Null
+          # The product links the static CRT (CMAKE_MSVC_RUNTIME_LIBRARY MultiThreaded), so the
+          # libraries linked into it come from x64-windows-static; FFmpeg stays a set of DLLs.
+          # Xbox (scripts/xbox/dependency-lock.json): libdatachannel with media (srtp) and the author's
+          # patched libjuice. An older tree with them built otherwise gets them rebuilt.
+          $ldc = & "$env:VROOT\v\vcpkg.exe" list --classic libdatachannel
+          if (($ldc -match '^libdatachannel:x64-windows-static') -and -not ($ldc -match '^libdatachannel\[srtp\]:x64-windows-static')) {
+            & "$env:VROOT\v\vcpkg.exe" remove --classic --recurse libdatachannel:x64-windows-static libjuice:x64-windows-static
+          }
+          & "$env:VROOT\v\vcpkg.exe" install --classic "--overlay-ports=$env:VROOT\vcpkg-overlay" "--overlay-ports=$PWD\scripts\xbox\vcpkg-overlay" --clean-after-build `
+            'ffmpeg[core,avcodec,avformat,avfilter,swresample,swscale,dav1d,zlib]:x64-windows' `
+            'libass:x64-windows-static' `
+            'openssl:x64-windows-static' 'opus:x64-windows-static' 'json-c:x64-windows-static' `
+            'libevent:x64-windows-static' 'miniupnpc:x64-windows-static' `
+            'libdatachannel[core,srtp,ws]:x64-windows-static' 'nlohmann-json:x64-windows-static' `
+            'pkgconf:x64-windows'
+          $list = & "$env:VROOT\v\vcpkg.exe" list --classic
+          $list | Set-Content -Encoding utf8 $env:VROOT\vcpkg-list.txt
+          $list | Write-Host
+
+      - name: Save vcpkg binary cache
+        if: always() && runner.environment == 'github-hosted'
+        uses: actions/cache/save@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: ${{ env.VROOT }}\vcache
+          key: vcpkg-full-${{ env.VCPKG_COMMIT }}-${{ env.OVERLAY_HASH }}-v1-${{ github.run_id }}
+
+      - name: Build SDL 3.4.14 (static, gamepad input for PS5 Remote Play)
+        run: |
+          if (Test-Path $env:VROOT\sdl3\include\SDL3\SDL.h) { Write-Host 'SDL already built'; exit 0 }
+          $archive = "$env:VROOT\sdl3-src.tar.gz"
+          Invoke-WebRequest -UseBasicParsing https://github.com/libsdl-org/SDL/archive/refs/tags/release-3.4.14.tar.gz -OutFile $archive
+          $hash = (Get-FileHash -Algorithm SHA512 $archive).Hash.ToLowerInvariant()
+          if ($hash -ne $env:SDL3_SHA512) { throw "SDL3 archive hash $hash" }
+          New-Item -ItemType Directory -Force $env:VROOT\sdl3-src | Out-Null
+          tar -xf $archive -C $env:VROOT\sdl3-src --strip-components 1
+          cmake -S $env:VROOT\sdl3-src -B $env:VROOT\sdl3-build -G Ninja -DCMAKE_BUILD_TYPE=Release `
+            -DSDL_STATIC=ON -DSDL_SHARED=OFF -DSDL_TEST_LIBRARY=OFF -DSDL_TESTS=OFF -DSDL_EXAMPLES=OFF `
+            -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded "-DCMAKE_INSTALL_PREFIX=$env:VROOT\sdl3"
+          cmake --build $env:VROOT\sdl3-build --parallel
+          cmake --install $env:VROOT\sdl3-build
+
+      - name: Stage the Magewell MWCapture SDK 3.3.1.1596 headers (Pro Capture native path)
+        run: |
+          # The same SDK the official build uses (licenses/magewell/MWCapture-SDK-NOTICE.txt): the
+          # vendor zip holds an Inno Setup installer, unpacked without running it by innoextract.
+          if (-not (Get-ChildItem $env:VROOT\mw-sdk -Recurse -Filter MWCapture.h -ErrorAction SilentlyContinue)) {
+            foreach ($d in "$env:VROOT\mw-zip", "$env:VROOT\innoextract", "$env:VROOT\mw-sdk") { if (Test-Path $d) { Remove-Item $d -Recurse -Force } }
+            Invoke-WebRequest -UseBasicParsing https://www.magewell.cn/files/sdk/Magewell_Capture_SDK_Windows_3.3.1.1596.zip -OutFile $env:VROOT\mw.zip
+            if ((Get-FileHash $env:VROOT\mw.zip).Hash -ne 'B463EE004050C05F06BD2A0BA0B906C2CA4D5D4D65F57D4E9DA57E00B2096C5A') { throw 'Magewell SDK hash' }
+            Invoke-WebRequest -UseBasicParsing https://github.com/dscharrer/innoextract/releases/download/1.9/innoextract-1.9-windows.zip -OutFile $env:VROOT\ie.zip
+            if ((Get-FileHash $env:VROOT\ie.zip).Hash -ne '6989342C9B026A00A72A38F23B62A8E6A22CC5DE69805CF47D68AC2FEC993065') { throw 'innoextract hash' }
+            Expand-Archive $env:VROOT\mw.zip $env:VROOT\mw-zip
+            Expand-Archive $env:VROOT\ie.zip $env:VROOT\innoextract
+            & "$env:VROOT\innoextract\innoextract.exe" --silent --output-dir $env:VROOT\mw-sdk (Get-ChildItem $env:VROOT\mw-zip -Recurse -Filter MWCaptureSDK.exe).FullName
+          }
+          $header = Get-ChildItem $env:VROOT\mw-sdk -Recurse -Filter MWCapture.h | Where-Object { $_.Directory.Name -eq 'LibMWCapture' } | Select-Object -First 1
+          if (-not $header) { Get-ChildItem $env:VROOT\mw-sdk -Recurse -Depth 4 | Select-Object -First 60 FullName | Out-Host; throw 'MWCapture.h not found' }
+          $root = $header.Directory.Parent.Parent.FullName   # <root>\Include\LibMWCapture\MWCapture.h
+          Write-Host "Magewell SDK root: $root"
+          "MAGEWELL_SDK=$($root -replace '\\', '/')" >> $env:GITHUB_ENV
+
+      - name: Stage the CUDA driver headers (native NVIDIA VFG)
+        run: |
+          # cuda.h only (build time, never packaged), from NVIDIA's public CUDA 12.6.3 redistributable
+          # (redistrib_12.6.3.json). The official build points VEYRA_CUDA_DRIVER_INCLUDE_DIR at such headers.
+          if (-not (Get-ChildItem $env:VROOT\cudart -Recurse -Filter cuda.h -ErrorAction SilentlyContinue)) {
+            if (Test-Path $env:VROOT\cudart) { Remove-Item $env:VROOT\cudart -Recurse -Force }
+            Invoke-WebRequest -UseBasicParsing https://developer.download.nvidia.com/compute/cuda/redist/cuda_cudart/windows-x86_64/cuda_cudart-windows-x86_64-12.6.77-archive.zip -OutFile $env:VROOT\cudart.zip
+            if ((Get-FileHash $env:VROOT\cudart.zip).Hash -ne '7A313BC0C93B1A50BB03AA9783A199AE70C3B66E2D8084DA65E8254A8577B925') { throw 'cudart hash' }
+            Expand-Archive $env:VROOT\cudart.zip $env:VROOT\cudart
+          }
+          $header = Get-ChildItem $env:VROOT\cudart -Recurse -Filter cuda.h | Select-Object -First 1
+          if (-not $header) { throw 'cuda.h not found' }
+          "CUDA_INCLUDE=$($header.Directory.FullName -replace '\\', '/')" >> $env:GITHUB_ENV
+
+      - name: Stage protoc 29.3 (chiaki-ng compiles its Takion protocol schema with it)
+        run: |
+          $protoc = "$env:VROOT\protoc"
+          if (-not (Test-Path "$protoc\bin\protoc.exe")) {
+            if (Test-Path $protoc) { Remove-Item $protoc -Recurse -Force }
+            Invoke-WebRequest -UseBasicParsing https://github.com/protocolbuffers/protobuf/releases/download/v29.3/protoc-29.3-win64.zip -OutFile "$env:VROOT\protoc.zip"
+            if ((Get-FileHash "$env:VROOT\protoc.zip").Hash -ne '57EA59E9F551AD8D71FFAA9B5CFBE0CA1F4E720972A1DB7EC2D12AB44BFF9383') { throw 'protoc hash' }
+            Expand-Archive "$env:VROOT\protoc.zip" $protoc
+          }
+          "$protoc\bin" >> $env:GITHUB_PATH
+
+      - name: Stage pinned chiaki-ng with the reviewed patches
+        run: |
+          python -m pip install --quiet protobuf grpcio-tools
+          function Get-Head([string]$dir) {   # the checked-out commit, '' when there is none yet
+            $PSNativeCommandUseErrorActionPreference = $false
+            $head = git -C $dir rev-parse -q --verify HEAD 2>$null
+            if ($LASTEXITCODE) { '' } else { "$head".Trim() }
+          }
+          if ((Test-Path $env:VROOT\chiaki\.git) -and (Get-Head $env:VROOT\chiaki) -eq $env:CHIAKI_COMMIT -and
+              -not (git -C $env:VROOT\chiaki status --porcelain --ignore-submodules=none)) {
+            Write-Host 'chiaki-ng clone already at the pinned commit'
+          } else {
+            foreach ($d in "$env:VROOT\chiaki-stage", "$env:VROOT\chiaki") { if (Test-Path $d) { Remove-Item $d -Recurse -Force } }
+            git init -q $env:VROOT\chiaki
+            git -C $env:VROOT\chiaki remote add origin https://github.com/streetpea/chiaki-ng.git
+            git -C $env:VROOT\chiaki fetch -q origin $env:CHIAKI_COMMIT
+            git -C $env:VROOT\chiaki -c advice.detachedHead=false checkout -q FETCH_HEAD
+            git -C $env:VROOT\chiaki submodule update -q --init --recursive
+          }
+          # The stage is made afresh every time: the patches go onto a clean tree.
+          if (Test-Path $env:VROOT\chiaki-stage) { Remove-Item $env:VROOT\chiaki-stage -Recurse -Force }
+          git -C $env:VROOT\chiaki worktree prune
+          git -C $env:VROOT\chiaki worktree add --detach $env:VROOT\chiaki-stage $env:CHIAKI_COMMIT
+          git -C $env:VROOT\chiaki-stage submodule update -q --init --recursive
+          foreach ($name in '0001-chiaki-msvc-vla-compat.patch', '0002-chiaki-video-metadata.patch',
+                            '0003-chiaki-feedback-history.patch', '0004-chiaki-pad-proc-no.patch',
+                            '0005-chiaki-udp-receive-buffer.patch') {
+            git -C $env:VROOT\chiaki-stage apply --check "$PWD\scripts\remoteplay\patches\$name"
+            git -C $env:VROOT\chiaki-stage apply "$PWD\scripts\remoteplay\patches\$name"
+          }
+          python scripts/remoteplay/verify-chiaki-stage.py --stage $env:VROOT\chiaki-stage --clean $env:VROOT\chiaki
+
+      - name: Stage pinned moonlight-common-c
+        run: |
+          function Get-Head([string]$dir) {   # the checked-out commit, '' when there is none yet
+            $PSNativeCommandUseErrorActionPreference = $false
+            $head = git -C $dir rev-parse -q --verify HEAD 2>$null
+            if ($LASTEXITCODE) { '' } else { "$head".Trim() }
+          }
+          if (-not ((Test-Path $env:VROOT\moonlight\.git) -and (Get-Head $env:VROOT\moonlight) -eq $env:MOONLIGHT_COMMIT -and
+                    -not (git -C $env:VROOT\moonlight status --porcelain --ignore-submodules=none))) {
+            if (Test-Path $env:VROOT\moonlight) { Remove-Item $env:VROOT\moonlight -Recurse -Force }
+            git init -q $env:VROOT\moonlight
+            git -C $env:VROOT\moonlight remote add origin https://github.com/moonlight-stream/moonlight-common-c.git
+            git -C $env:VROOT\moonlight fetch -q origin $env:MOONLIGHT_COMMIT
+            git -C $env:VROOT\moonlight -c advice.detachedHead=false checkout -q FETCH_HEAD
+            git -C $env:VROOT\moonlight submodule update -q --init --recursive
+          }
+          python scripts/moonlight/verify-moonlight-stage.py --source $env:VROOT\moonlight --lock scripts/moonlight/dependency-lock.json
+
+      - name: Configure (preset x64-release, all features)
+        run: |
+          $static = "$env:VROOT_FWD/v/installed/x64-windows-static"
+          $env:PKG_CONFIG_PATH = "$static/lib/pkgconfig"
+          cmake --preset x64-release -B $env:VROOT\b `
+            -DVEYRA_BUILD_QML_UI=ON `
+            -DVEYRA_ENABLE_EXPERIMENTAL_DLSSNR=ON `
+            "-DVEYRA_DLSS_SDK_ROOT=$((Resolve-Path third_party_local/nvidia/DLSS_SDK_310.7.0).Path)" `
+            "-DVEYRA_FFMPEG_ROOT=$env:VROOT_FWD/v/installed/x64-windows" `
+            "-DVEYRA_LIBASS_ROOT=$static" `
+            "-DVEYRA_LIBDOVI_ROOT=$env:VROOT_FWD/dovi" `
+            -DVEYRA_ENABLE_REMOTEPLAY=ON "-DVEYRA_RP_CHIAKI_SOURCE_DIR=$env:VROOT_FWD/chiaki-stage" "-DVEYRA_RP_CHIAKI_VERIFY_DIR=$env:VROOT_FWD/chiaki" `
+            -DCHIAKI_USE_SYSTEM_CURL=OFF -DCHIAKI_USE_SYSTEM_NANOPB=OFF -DCHIAKI_USE_SYSTEM_JERASURE=OFF `
+            -DVEYRA_ENABLE_MOONLIGHT=ON "-DVEYRA_MOONLIGHT_SOURCE_DIR=$env:VROOT_FWD/moonlight" `
+            -DVEYRA_ENABLE_XBOX=ON `
+            "-DVEYRA_MAGEWELL_SDK_DIR=$env:MAGEWELL_SDK" `
+            "-DVEYRA_CUDA_DRIVER_INCLUDE_DIR=$env:CUDA_INCLUDE" `
+            "-DOPENSSL_ROOT_DIR=$static" -DOPENSSL_USE_STATIC_LIBS=ON `
+            "-DPKG_CONFIG_EXECUTABLE=$env:VROOT_FWD/v/installed/x64-windows/tools/pkgconf/pkgconf.exe" `
+            "-DCMAKE_PREFIX_PATH=$env:QT_ROOT_DIR;$static;$env:VROOT_FWD/sdl3"
+
+      - name: Build veyra_qml_ui, virtual camera and shaders
+        run: |
+          $env:PKG_CONFIG_PATH = "$env:VROOT_FWD/v/installed/x64-windows-static/lib/pkgconfig"
+          cmake --build $env:VROOT\b --parallel --target veyra_qml_ui veyra_virtualcam_components
+          $shaders = ninja -C $env:VROOT\b -t targets all | ForEach-Object { ($_ -split ':')[0] } | Where-Object { $_ -match '^veyra_shader_' } | Sort-Object -Unique
+          if ($shaders) { cmake --build $env:VROOT\b --parallel --target @shaders }
+
+      - name: Build the voice tools and run the subtitle tests
+        run: |
+          cmake --build $env:VROOT\b --parallel --target veyra_tts_cli veyra_voiceid_cli veyra_tts_subtitle_tests veyra_tts_narrator_tests veyra_screen_text_tests veyra_subtitle_finder_tests veyra_subtitle_style_tests
+          & "$env:VROOT\b\veyra_tts_subtitle_tests.exe"
+          if ($LASTEXITCODE) { throw 'subtitle tests' }
+          & "$env:VROOT\b\veyra_tts_narrator_tests.exe"
+          if ($LASTEXITCODE) { throw 'narrator tests' }
+          & "$env:VROOT\b\veyra_screen_text_tests.exe"
+          if ($LASTEXITCODE) { throw 'screen text tests' }
+          & "$env:VROOT\b\veyra_subtitle_finder_tests.exe"
+          if ($LASTEXITCODE) { throw 'subtitle finder tests' }
+          & "$env:VROOT\b\veyra_subtitle_style_tests.exe"
+          if ($LASTEXITCODE) { throw 'subtitle style tests' }
+
+      - name: Package over the official ${{ env.BASE_VERSION }} portable packages
+        run: |
+          foreach ($d in "$env:VROOT\rel", "$env:VROOT\pkg") { if (Test-Path $d) { Remove-Item $d -Recurse -Force } }
+          New-Item -ItemType Directory -Force "$env:VROOT\rel", "$env:VROOT\pkg", "$env:VROOT\veyra-official" | Out-Null
+          $commit = $env:GITHUB_SHA.Substring(0, 10)
+          foreach ($flavor in 'NVIDIA', 'AMD') {
+            $official = "Veyra-$env:BASE_VERSION-$flavor-win64-portable"
+            $zip = "$env:VROOT\veyra-official\$official.zip"   # kept: an own runner downloads it once
+            if (-not (Test-Path $zip)) {
+              Invoke-WebRequest -UseBasicParsing "https://github.com/Likely7/Veyra-NRVideo/releases/download/v$env:BASE_VERSION/$official.zip" -OutFile "$zip.part"
+              Move-Item "$zip.part" $zip
+            }
+            tar -xf $zip -C $env:VROOT\pkg
+            $name = "Veyra-$env:BASE_VERSION-voice-$flavor-win64-portable"
+            Rename-Item "$env:VROOT\pkg\$official" $name
+            $app = "$env:VROOT\pkg\$name\versions\$env:BASE_VERSION"
+            if (-not (Test-Path "$app\veyra_qml_ui.exe")) { throw "unexpected layout of $official" }
+            # The program and what is built with it; GPU runtimes, Qt and models stay as released.
+            Copy-Item $env:VROOT\b\veyra_qml_ui.exe $app -Force
+            Remove-Item "$app\qml\Veyra" -Recurse -Force
+            Copy-Item $env:VROOT\b\qml\Veyra "$app\qml\Veyra" -Recurse
+            Copy-Item i18n\catalog.json "$app\i18n\catalog.json" -Force
+            $shaderRoot = (Resolve-Path $env:VROOT\b\shaders).Path
+            Get-ChildItem $shaderRoot -Recurse -Filter *.dxil | ForEach-Object {
+              $dst = Join-Path "$app\shaders" $_.FullName.Substring($shaderRoot.Length + 1)
+              New-Item -ItemType Directory -Force (Split-Path $dst) | Out-Null
+              Copy-Item $_.FullName $dst -Force
+            }
+            Copy-Item $env:VROOT\v\installed\x64-windows\bin\*.dll $app -Force
+            Copy-Item $env:VROOT\dovi\bin\*.dll $app -Force
+            foreach ($f in 'THIRD_PARTY_NOTICES.md', 'LICENSE') { Copy-Item $f $app -Force }
+            @"
+          Veyra $env:BASE_VERSION with subtitle voice-over (unofficial build of the fork oneevil/Veyra-NRVideo).
+          Program built by GitHub Actions ($env:RUNNER_NAME) from commit $env:GITHUB_SHA (run $env:GITHUB_RUN_ID);
+          GPU runtimes, Qt and the other files are those of the official Veyra $env:BASE_VERSION $flavor package.
+          Source: https://github.com/$env:GITHUB_REPOSITORY/tree/$env:GITHUB_SHA
+          In-app updates are off in this build: use this fork's releases page.
+          "@ | Set-Content -Encoding utf8 "$app\VOICE-BUILD.txt"
+            Push-Location $env:VROOT\pkg
+            7z a -tzip -mx=5 "$env:VROOT\rel\$name.zip" $name | Out-Null
+            Pop-Location
+            Remove-Item "$env:VROOT\pkg\$name" -Recurse -Force
+          }
+          Get-ChildItem $env:VROOT\rel\*.zip | ForEach-Object { "{0}  {1}" -f (Get-FileHash $_.FullName).Hash.ToLowerInvariant(), $_.Name } |
+            Set-Content -Encoding utf8 $env:VROOT\rel\SHA256SUMS.txt
+          Get-Content $env:VROOT\rel\SHA256SUMS.txt | Write-Host
+
+      # An own runner keeps the packages in $VROOT\rel; uploading 1.4 GB from a home line is slow.
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: runner.environment == 'github-hosted'
+        with:
+          name: veyra-voice-packages
+          path: |
+            ${{ env.VROOT }}\rel\*.zip
+            ${{ env.VROOT }}\rel\SHA256SUMS.txt
+          compression-level: 0
+
+      - name: Publish the release
+        if: startsWith(github.ref, 'refs/tags/') || inputs.publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || inputs.tag }}
+        run: |
+          $notes = Get-Content -Raw scripts/voice/release-notes.md
+          $notes = $notes.Replace('{COMMIT}', $env:GITHUB_SHA).Replace('{REPO}', $env:GITHUB_REPOSITORY).Replace('{BASE}', $env:BASE_VERSION)
+          $notes | Set-Content -Encoding utf8 $env:VROOT\rel\notes.md
+          gh release create $env:TAG --repo $env:GITHUB_REPOSITORY --target $env:GITHUB_SHA `
+            --title "Veyra $env:BASE_VERSION · озвучка субтитров / subtitle voice-over" --notes-file $env:VROOT\rel\notes.md `
+            (Get-ChildItem $env:VROOT\rel\*.zip).FullName $env:VROOT\rel\SHA256SUMS.txt

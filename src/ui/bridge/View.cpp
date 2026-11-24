@@ -1,5 +1,6 @@
 // QML bridge: View responsibilities.
 #include "../QmlPlayerBridge_p.h"
+#include "../LiveTranslation.h"
 #include "veyra/ui/MaskGeometry.h"
 
 namespace veyra::ui {
@@ -46,7 +47,7 @@ QVariantMap QmlPlayerBridge::maskState(bool allEffects) const {
     const auto& first=value.regions[0];
     return {{"overlayVisible",allEffects&&exclusionOverlayVisible()},{"selected",allEffects?impl_->exclusionSelected:-1},{"enabled",node&&node->enabled},{"feather",value.featherPixels},{"regions",regions},
         {"left",first.left},{"top",first.top},{"right",first.right},{"bottom",first.bottom},
-        {"drawShape",impl_->protExclusion==allEffects?impl_->protDraw:QString{}}};
+        {"drawShape",impl_->protExclusion==allEffects&&impl_->protDraw!=QLatin1String("translation")?impl_->protDraw:QString{}}};
 }
 QVariantMap QmlPlayerBridge::exclusionState() const {return maskState(true);}
 QVariantList QmlPlayerBridge::protectionRegions() const {return maskState(false).value("regions").toList();}
@@ -95,6 +96,16 @@ bool QmlPlayerBridge::beginMaskDraw(bool allEffects,const QString& shape) {
     return true;
 }
 
+bool QmlPlayerBridge::beginTranslationRegionDraw() {
+    auto& i = *impl_;
+    if (!i.snapshot.running || !i.videoWindow) { emit notice(tr("请先打开视频，再在画面上框选识别区域"), true); return false; }
+    endExclusionMove(false);
+    i.protDraw = QStringLiteral("translation");
+    i.protExclusion = false;
+    emit protectionDrawChanged(); emit protectionChanged();
+    return true;
+}
+
 void QmlPlayerBridge::updateProtectionDraw(double x0, double y0, double x1, double y1) {
     auto& i = *impl_;
     if (i.protDraw.isEmpty() || !i.videoWindow) return;
@@ -112,6 +123,7 @@ bool QmlPlayerBridge::commitProtectionDraw(double x0, double y0, double x1, doub
     const bool allEffects=i.protExclusion;
     const bool ellipse = i.protDraw == QLatin1String("ellipse");
     const bool armed = !i.protDraw.isEmpty();
+    const bool translationArea = i.protDraw == QLatin1String("translation");
     beginProtectionDraw(QString());
     if (!armed || !i.videoWindow) return false;
     RECT client{}; GetClientRect(i.videoWindow, &client);
@@ -124,6 +136,16 @@ bool QmlPlayerBridge::commitProtectionDraw(double x0, double y0, double x1, doub
     const auto view = i.engine.previewView();
     const auto a = view.sourcePoint(float(x0 * w), float(y0 * h), float(w), float(h), float(e.width), float(e.height));
     const auto b = view.sourcePoint(float(x1 * w), float(y1 * h), float(w), float(h), float(e.width), float(e.height));
+    if (translationArea) {
+        // The area live translation reads, as fractions of the picture.
+        const float left = std::clamp(std::min(a.first, b.first), 0.0f, 1.0f), top = std::clamp(std::min(a.second, b.second), 0.0f, 1.0f);
+        const float right = std::clamp(std::max(a.first, b.first), 0.0f, 1.0f), bottom = std::clamp(std::max(a.second, b.second), 0.0f, 1.0f);
+        if (right - left < 0.02f || bottom - top < 0.02f || !liveTranslation_) return false;
+        liveTranslation_->setCustomRegion(QRectF(left, top, right - left, bottom - top));
+        liveTranslation_->setScreenRegion(LiveTranslation::CustomRegion);
+        veyra::log::info("live-translation", std::format("screen region drawn {:.3f},{:.3f},{:.3f},{:.3f}", left, top, right - left, bottom - top));
+        return true;
+    }
     engine::ProtectionRect q{std::clamp(std::min(a.first, b.first), 0.0f, 1.0f), std::clamp(std::min(a.second, b.second), 0.0f, 1.0f),
                              std::clamp(std::max(a.first, b.first), 0.0f, 1.0f), std::clamp(std::max(a.second, b.second), 0.0f, 1.0f), ellipse};
     if (q.empty()) return false;

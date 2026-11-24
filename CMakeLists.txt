@@ -146,6 +146,14 @@ target_link_libraries(veyra_private_frame_trace_tests PRIVATE veyra_base)
 add_executable(veyra_screen_text_tests tests/unit/ScreenTextTests.cpp src/engine/ScreenText.cpp)
 target_compile_features(veyra_screen_text_tests PRIVATE cxx_std_20)
 target_link_libraries(veyra_screen_text_tests PRIVATE veyra_base)
+# Which text read off the picture is the subtitle, and when a line is released (neural reader path).
+add_executable(veyra_subtitle_style_tests tests/unit/SubtitleStyleTests.cpp src/engine/SubtitleStyle.cpp src/engine/SubtitleTracker.cpp)
+target_compile_features(veyra_subtitle_style_tests PRIVATE cxx_std_20)
+target_link_libraries(veyra_subtitle_style_tests PRIVATE veyra_base)
+# Where the subtitles are, from the text boxes of several looks at the picture.
+add_executable(veyra_subtitle_finder_tests tests/unit/SubtitleFinderTests.cpp src/engine/SubtitleFinder.cpp)
+target_compile_features(veyra_subtitle_finder_tests PRIVATE cxx_std_20)
+target_link_libraries(veyra_subtitle_finder_tests PRIVATE veyra_base)
 
 # When each on-screen line's translation is shown (src/ui/CaptionPresenter.h, no Qt).
 add_executable(veyra_caption_presenter_tests tests/unit/CaptionPresenterTests.cpp)
@@ -1420,6 +1428,24 @@ if(VEYRA_BUILD_QML_UI AND Qt6_FOUND)
     src/ui/AsrWorker.cpp src/ui/AsrWorker.h
     src/ui/TranslationAssets.cpp src/ui/TranslationAssets.h
     src/ui/WinCaptionReader.cpp src/ui/WinCaptionReader.h
+    # Live translation read aloud: TeraTTSv2 on ONNX Runtime in a worker process.
+    src/ui/VoiceOver.cpp src/ui/VoiceOver.h
+    src/ui/VoiceOutput.cpp src/ui/VoiceOutput.h
+    src/ui/VoiceModels.cpp src/ui/VoiceModels.h
+    src/ui/OcrModels.cpp src/ui/OcrModels.h
+    src/ui/VoiceWorker.cpp src/ui/VoiceProtocol.h
+    src/ui/GameAudio.cpp src/ui/GameAudio.h
+    src/tts/Features.cpp src/tts/Features.h
+    src/tts/VoiceId.cpp src/tts/VoiceId.h src/tts/GenderGraph.inc
+    src/tts/Gzip.cpp src/tts/Gzip.h
+    src/tts/Numbers.cpp src/tts/Numbers.h
+    src/tts/RuStress.cpp src/tts/RuStress.h
+    src/tts/Tokenizers.cpp src/tts/Tokenizers.h
+    src/tts/SubtitleText.cpp src/tts/SubtitleText.h
+    src/tts/TeraVoice.cpp src/tts/TeraVoice.h
+    src/tts/Narrators.cpp src/tts/Narrators.h
+    src/tts/Cast.cpp src/tts/Cast.h
+    src/tts/Utf8.h
     include/veyra/ui/QmlPlayerBridge.h include/veyra/ui/ThumbnailProvider.h
     # Custom: the start-up format badge, same layered-window construction.
     src/media/FormatBadgeWindow.cpp
@@ -1505,6 +1531,23 @@ if(VEYRA_BUILD_QML_UI AND Qt6_FOUND)
   # piece of the old shell worth keeping, and its own dialog is what users
   # expect from a desktop app. No QWidget UI is created.
   target_link_libraries(veyra_qml_bridge PUBLIC veyra_engine Qt6::Core Qt6::Gui Qt6::Qml Qt6::Quick Qt6::QuickControls2 Qt6::Widgets Qt6::Network PRIVATE shell32 ole32 oleaut32 uiautomationcore iphlpapi ws2_32 ${FFMPEG_LIBRARIES})
+  # The voice engine on its own: speaks one line to a WAV file (no Qt, no player).
+  add_executable(veyra_tts_cli tests/tts/TeraVoiceCli.cpp
+    src/tts/Gzip.cpp src/tts/Numbers.cpp src/tts/Ort.cpp src/tts/RuStress.cpp src/tts/Tokenizers.cpp src/tts/TeraVoice.cpp src/tts/Narrators.cpp)
+  target_compile_features(veyra_tts_cli PRIVATE cxx_std_20)
+  target_compile_options(veyra_tts_cli PRIVATE /utf-8)
+  target_compile_definitions(veyra_tts_cli PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
+  # Tells the voices of clips apart (man or woman, which speaker), as the voice worker does.
+  add_executable(veyra_voiceid_cli tests/tts/VoiceIdCli.cpp src/tts/VoiceId.cpp src/tts/Features.cpp src/tts/Ort.cpp src/tts/Narrators.cpp)
+  target_compile_features(veyra_voiceid_cli PRIVATE cxx_std_20)
+  target_compile_options(veyra_voiceid_cli PRIVATE /utf-8)
+  target_compile_definitions(veyra_voiceid_cli PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
+  add_executable(veyra_tts_subtitle_tests tests/tts/SubtitleTextTests.cpp src/tts/SubtitleText.cpp)
+  target_compile_features(veyra_tts_subtitle_tests PRIVATE cxx_std_20)
+  target_compile_options(veyra_tts_subtitle_tests PRIVATE /utf-8)
+  add_executable(veyra_tts_narrator_tests tests/tts/NarratorTests.cpp src/tts/Narrators.cpp src/tts/Cast.cpp)
+  target_compile_features(veyra_tts_narrator_tests PRIVATE cxx_std_20)
+  target_compile_options(veyra_tts_narrator_tests PRIVATE /utf-8)
   add_executable(veyra_playlist_tests tests/unit/PlaylistModelTests.cpp src/ui/PlaylistModel.cpp include/veyra/ui/PlaylistModel.h)
   set_target_properties(veyra_playlist_tests PROPERTIES AUTOMOC ON)
   target_compile_features(veyra_playlist_tests PRIVATE cxx_std_20)
@@ -1825,7 +1868,12 @@ add_executable(veyra_sr_reconstruction_tests tests/integration/SrReconstructionT
   target_link_libraries(veyra_engine PUBLIC veyra_virtualcam_transport advapi32)
   # On-screen text for live translation: OCR reading logic (portable, ported from
   # VI Translator, MIT) and the Windows OCR reader of the presented picture.
-  target_sources(veyra_engine PRIVATE src/engine/ScreenText.cpp src/engine/ScreenTextCapture.cpp)
+  # The neural reader (PP-OCRv5 after RapidOCR, Apache-2.0) on ONNX Runtime loaded at run time,
+  # the sorting of subtitle text from the scene, the line tracker and the subtitle-area search.
+  # (src/tts/Ort.cpp lives here: the voice in the bridge uses it too.)
+  target_sources(veyra_engine PRIVATE src/engine/ScreenText.cpp src/engine/ScreenTextCapture.cpp
+    src/engine/SubtitleFinder.cpp src/engine/NeuralOcr.cpp src/engine/SubtitleStyle.cpp
+    src/engine/SubtitleTracker.cpp src/engine/WordList.cpp src/tts/Ort.cpp)
   target_link_libraries(veyra_engine PRIVATE windowsapp)
   add_dependencies(veyra_engine veyra_shader_virtual_camera_nv12)
   target_compile_options(veyra_engine PRIVATE /utf-8)

@@ -72,6 +72,76 @@ var translations = {
         "right": "右側",
         "brightness": "背景の明るさ",
         "images": "画像"
+    },
+    "ru": {
+        "title": "Фон по бокам",
+        "black": "Чёрный",
+        "builtin": "Встроенный",
+        "custom": "Свой",
+        "slideshow": "Слайд-шоу",
+        "interval": "Каждые 20 секунд картинки по бокам меняются на случайные.",
+        "preview": "Превью сторон",
+        "select": "Нажмите на левое или правое превью, чтобы выбрать картинку для этой стороны.",
+        "left": "Слева",
+        "right": "Справа",
+        "brightness": "Яркость фона",
+        "images": "Картинки"
+    },
+    "de": {
+        "title": "Seitenhintergründe",
+        "black": "Schwarz",
+        "builtin": "Integriert",
+        "custom": "Eigene",
+        "slideshow": "Diashow",
+        "interval": "Beide Seiten wechseln alle 20 Sekunden zu zufälligen Hochformatbildern.",
+        "preview": "Seitenvorschau",
+        "select": "Wählen Sie eine Vorschau, um das Bild für diese Seite festzulegen.",
+        "left": "Links",
+        "right": "Rechts",
+        "brightness": "Hintergrundhelligkeit",
+        "images": "Bilder"
+    },
+    "es": {
+        "title": "Fondos laterales",
+        "black": "Negro",
+        "builtin": "Integrado",
+        "custom": "Personalizado",
+        "slideshow": "Presentación",
+        "interval": "Ambos lados cambian a imágenes verticales aleatorias cada 20 segundos.",
+        "preview": "Vista previa de los lados",
+        "select": "Selecciona una vista previa para elegir la imagen de ese lado.",
+        "left": "Izquierda",
+        "right": "Derecha",
+        "brightness": "Brillo del fondo",
+        "images": "Imágenes"
+    },
+    "fr": {
+        "title": "Arrière-plans latéraux",
+        "black": "Noir",
+        "builtin": "Intégré",
+        "custom": "Personnalisé",
+        "slideshow": "Diaporama",
+        "interval": "Les deux côtés passent à des images verticales aléatoires toutes les 20 secondes.",
+        "preview": "Aperçu des côtés",
+        "select": "Sélectionnez un aperçu pour choisir l’image de ce côté.",
+        "left": "Gauche",
+        "right": "Droite",
+        "brightness": "Luminosité de l’arrière-plan",
+        "images": "Images"
+    },
+    "pt-BR": {
+        "title": "Fundos laterais",
+        "black": "Preto",
+        "builtin": "Integrado",
+        "custom": "Personalizado",
+        "slideshow": "Apresentação",
+        "interval": "Os dois lados mudam para imagens verticais aleatórias a cada 20 segundos.",
+        "preview": "Prévia dos lados",
+        "select": "Selecione uma prévia para escolher a imagem desse lado.",
+        "left": "Esquerda",
+        "right": "Direita",
+        "brightness": "Brilho do fundo",
+        "images": "Imagens"
     }
 }
 

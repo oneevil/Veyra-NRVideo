@@ -14,6 +14,10 @@ inline constexpr int modelCount = 2;
 enum Model { Parakeet, Whisper };
 QString root(const QString& dataDirectory);
 std::span<const ModelAsset> assets(int model);
+// sherpa-onnx's runtime folder, which holds the onnxruntime.dll the voice uses too.
+const ModelAsset& runtimeAsset();
+// Silero VAD, which the voice uses too to keep only speech when it listens to the game.
+const ModelAsset& vadAsset();
 bool verify(const QString& root, int model, bool contents);
 QString whisperLanguage(const QString& language);
 

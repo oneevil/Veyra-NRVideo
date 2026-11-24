@@ -67,6 +67,11 @@ std::wstring preferredRenderEndpoint();
 // device), instead of mapping channels to the device layout.
 void setForceStereoDownmix(bool enabled);
 bool forceStereoDownmix();
+// Live translation's voice turns the player down while it speaks (1 = untouched). Applied
+// with the user's volume in every AudioRenderer, after the recording/recognition tap, so
+// recordings and speech recognition still get the original at full level.
+void setVoiceDuck(float gain);
+float voiceDuck();
 // What the most recently opened renderer actually uses.
 struct ActiveRenderEndpoint { std::wstring id, name; bool fallback = false; unsigned channels = 0; bool downmix = false; bool valid = false; };
 ActiveRenderEndpoint activeRenderEndpoint();
